@@ -40,7 +40,7 @@ pub fn main() -> Result<(), SidebarError> {
     };
     let sb = config::load(&path, args.name.as_deref())?;
     if args.run {
-        return sidebar::run(&sb.name, sb.config, &sb.command, args.hidden, sb.duration);
+        return sidebar::run(&sb.name, sb.config, &sb.command, args.hidden, sb.animations);
     }
     if sidebar::send_toggle(&sb.name)? {
         return Ok(());

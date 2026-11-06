@@ -1,3 +1,4 @@
+mod anim;
 mod cli;
 mod config;
 mod proxy;
@@ -48,6 +49,8 @@ enum SidebarError {
     InvalidName(String),
     #[error("sidebar `{0}` has an empty command")]
     EmptyCommand(String),
+    #[error("sidebar `{0}`: invalid animation: {1}")]
+    InvalidAnimation(String, String),
     #[error("sidebar `{0}` is already running")]
     AlreadyRunning(String),
     #[error("could not access pid file {}", .0.display())]

@@ -10,6 +10,7 @@
 use {
     crate::{
         SidebarError,
+        anim::{Animation, Animations, Curve, Overshoot, Spring},
         sidebar::{Config, Edge, Focus, Size},
     },
     serde::{Deserialize, Deserializer, de::Error as _},
@@ -17,6 +18,7 @@ use {
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
+        time::Duration,
     },
     wl_proxy::protocols::wlr_layer_shell_unstable_v1::{
         zwlr_layer_shell_v1::ZwlrLayerShellV1Layer,
@@ -29,7 +31,7 @@ pub struct Sidebar {
     pub name: String,
     pub config: Config,
     pub command: Vec<String>,
-    pub duration: u64,
+    pub animations: Animations,
 }
 
 #[derive(Deserialize, Debug)]
@@ -45,8 +47,11 @@ struct Entry {
     output: Option<String>,
     #[serde(default = "default_true")]
     reserve: bool,
-    #[serde(default = "default_duration")]
-    duration: u64,
+    /// Legacy shorthand for `animation.easing = { duration = N }`.
+    #[serde(default)]
+    duration: Option<u64>,
+    #[serde(default)]
+    animation: Option<AnimationArg>,
     #[serde(default)]
     layer: Layer,
     #[serde(default)]
@@ -65,6 +70,132 @@ struct Entry {
 enum CommandRepr {
     Argv(Vec<String>),
     Shell(String),
+}
+
+/// `[name.animation]`: `spring`/`easing` for both directions, overridden by `show`/`hide`.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct AnimationArg {
+    #[serde(default)]
+    spring: Option<SpringArg>,
+    #[serde(default)]
+    easing: Option<EasingArg>,
+    #[serde(default)]
+    show: Option<AnimSpec>,
+    #[serde(default)]
+    hide: Option<AnimSpec>,
+    #[serde(default)]
+    overshoot: Overshoot,
+}
+
+/// Exactly one of `spring` or `easing`.
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct AnimSpec {
+    #[serde(default)]
+    spring: Option<SpringArg>,
+    #[serde(default)]
+    easing: Option<EasingArg>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct SpringArg {
+    #[serde(default)]
+    damping_ratio: Option<f64>,
+    #[serde(default)]
+    stiffness: Option<f64>,
+    #[serde(default)]
+    epsilon: Option<f64>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct EasingArg {
+    #[serde(default)]
+    curve: Curve,
+    #[serde(default = "default_duration")]
+    duration: u64,
+}
+
+impl SpringArg {
+    fn resolve(&self) -> Result<Spring, String> {
+        let d = Spring::default();
+        let s = Spring {
+            damping_ratio: self.damping_ratio.unwrap_or(d.damping_ratio),
+            stiffness: self.stiffness.unwrap_or(d.stiffness),
+            epsilon: self.epsilon.unwrap_or(d.epsilon),
+        };
+        for (key, v) in [
+            ("damping-ratio", s.damping_ratio),
+            ("stiffness", s.stiffness),
+            ("epsilon", s.epsilon),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!("spring {key} must be > 0"));
+            }
+        }
+        Ok(s)
+    }
+}
+
+impl EasingArg {
+    fn resolve(&self) -> Animation {
+        Animation::Easing {
+            curve: self.curve,
+            duration: Duration::from_millis(self.duration),
+        }
+    }
+}
+
+/// `None` if neither `spring` nor `easing` is given.
+fn resolve_spec(
+    spring: &Option<SpringArg>,
+    easing: &Option<EasingArg>,
+) -> Result<Option<Animation>, String> {
+    match (spring, easing) {
+        (Some(_), Some(_)) => Err("give either `spring` or `easing`, not both".into()),
+        (Some(s), None) => s.resolve().map(Animation::Spring).map(Some),
+        (None, Some(e)) => Ok(Some(e.resolve())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_animations(
+    duration: Option<u64>,
+    arg: Option<&AnimationArg>,
+) -> Result<Animations, String> {
+    let Some(arg) = arg else {
+        let Some(ms) = duration else {
+            return Ok(Animations::default());
+        };
+        let a = Animation::Easing {
+            curve: Curve::EaseOutCubic,
+            duration: Duration::from_millis(ms),
+        };
+        return Ok(Animations {
+            show: a,
+            hide: a,
+            ..Animations::default()
+        });
+    };
+    if duration.is_some() {
+        return Err("give either `duration` or `animation`, not both".into());
+    }
+    let base = resolve_spec(&arg.spring, &arg.easing)?.unwrap_or_default();
+    let side = |spec: &Option<AnimSpec>, which: &str| -> Result<Animation, String> {
+        match spec {
+            None => Ok(base),
+            Some(s) => resolve_spec(&s.spring, &s.easing)
+                .map_err(|e| format!("{which}: {e}"))?
+                .ok_or_else(|| format!("{which}: needs `spring` or `easing`")),
+        }
+    };
+    Ok(Animations {
+        show: side(&arg.show, "show")?,
+        hide: side(&arg.hide, "hide")?,
+        overshoot: arg.overshoot,
+    })
 }
 
 #[derive(Deserialize, Debug, Default, Copy, Clone)]
@@ -225,10 +356,75 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
         output: entry.output,
         hide_on_unfocus: entry.hide_on_unfocus,
     };
+    let animations = resolve_animations(entry.duration, entry.animation.as_ref())
+        .map_err(|e| SidebarError::InvalidAnimation(name.clone(), e))?;
     Ok(Sidebar {
         name,
         config,
         command,
-        duration: entry.duration,
+        animations,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> Result<Animations, String> {
+        let e: Entry =
+            toml::from_str(&format!("command = \"x\"\n{toml}")).map_err(|e| e.to_string())?;
+        resolve_animations(e.duration, e.animation.as_ref())
+    }
+
+    #[test]
+    fn default_is_spring() {
+        assert_eq!(parse("").unwrap(), Animations::default());
+    }
+
+    #[test]
+    fn legacy_duration() {
+        let a = parse("duration = 0").unwrap();
+        let instant = Animation::Easing {
+            curve: Curve::EaseOutCubic,
+            duration: Duration::ZERO,
+        };
+        assert_eq!((a.show, a.hide), (instant, instant));
+        assert!(parse("duration = 100\nanimation.spring = {}").is_err());
+    }
+
+    #[test]
+    fn show_hide_split() {
+        let a = parse(
+            r#"
+            [animation]
+            spring = { damping-ratio = 0.5 }
+            overshoot = "clamp"
+            hide.easing = { curve = "ease-in-cubic", duration = 120 }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            a.show,
+            Animation::Spring(Spring {
+                damping_ratio: 0.5,
+                ..Spring::default()
+            })
+        );
+        assert_eq!(
+            a.hide,
+            Animation::Easing {
+                curve: Curve::EaseInCubic,
+                duration: Duration::from_millis(120),
+            }
+        );
+        assert_eq!(a.overshoot, Overshoot::Clamp);
+    }
+
+    #[test]
+    fn invalid() {
+        assert!(parse("animation.spring = { stiffness = 0 }").is_err());
+        assert!(parse("animation = { spring = {}, easing = {} }").is_err());
+        assert!(parse("animation.show = {}").is_err());
+        assert!(parse("animation.easing = { curve = \"nope\" }").is_err());
+    }
 }

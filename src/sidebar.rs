@@ -8,6 +8,7 @@
 use {
     crate::{
         SidebarError,
+        anim::Animations,
         proxy::{self, ClientWlDisplay},
         remap::{Phase, Remap},
     },
@@ -163,11 +164,13 @@ struct Slide {
     visible: bool,
     /// Position at `start`. 1.0 = fully shown, 0.0 = fully hidden.
     from: f64,
+    /// Velocity at `start`, carried over when toggling mid-animation.
+    velocity: f64,
     start: Instant,
+    anim: Animations,
 }
 
 static SLIDE: Mutex<Option<Slide>> = Mutex::new(None);
-static DURATION_MS: AtomicU64 = AtomicU64::new(0);
 /// Eventfds of all client threads, keyed by client id.
 static WAKERS: Mutex<Vec<(usize, Arc<uapi::OwnedFd>)>> = Mutex::new(Vec::new());
 /// `focus = "remap"`: toggling a shown but unfocused sidebar focuses it instead of hiding.
@@ -216,19 +219,20 @@ impl Drop for KeyboardFocus {
 }
 
 impl Slide {
-    /// Returns `(position, still_animating)`.
-    fn position(&self, now: Instant) -> (f64, bool) {
-        let target = if self.visible { 1.0 } else { 0.0 };
-        let dur = DURATION_MS.load(Relaxed);
-        if dur == 0 {
-            return (target, false);
-        }
-        let t = now.saturating_duration_since(self.start).as_secs_f64() * 1000.0 / dur as f64;
-        if t >= 1.0 {
-            return (target, false);
-        }
-        let eased = 1.0 - (1.0 - t).powi(3); // ease-out cubic
-        (self.from + (target - self.from) * eased, true)
+    /// Returns `(position, velocity, still_animating)`.
+    fn position(&self, now: Instant) -> (f64, f64, bool) {
+        let t = now.saturating_duration_since(self.start);
+        let s = self.anim.sample(self.visible, self.from, self.velocity, t);
+        (s.pos, s.vel, !s.done)
+    }
+
+    /// Starts animating towards `visible` from the current position and velocity.
+    fn retarget(&mut self, visible: bool, now: Instant) {
+        let (pos, vel, _) = self.position(now);
+        self.from = pos;
+        self.velocity = vel;
+        self.visible = visible;
+        self.start = now;
     }
 }
 
@@ -242,7 +246,7 @@ struct Snapshot {
 fn snapshot() -> Snapshot {
     let guard = SLIDE.lock().unwrap();
     let s = guard.as_ref().expect("slide state not initialized");
-    let (pos, animating) = s.position(Instant::now());
+    let (pos, _, animating) = s.position(Instant::now());
     Snapshot {
         pos,
         visible: s.visible,
@@ -257,14 +261,12 @@ pub fn toggle() {
         let mut guard = SLIDE.lock().unwrap();
         let s = guard.as_mut().expect("slide state not initialized");
         let now = Instant::now();
-        let (pos, animating) = s.position(now);
+        let (_, _, animating) = s.position(now);
         if REFOCUS_ENABLED.load(Relaxed) && s.visible && !animating && FOCUSED.load(Relaxed) == 0 {
             REFOCUS.fetch_add(1, Relaxed);
             log::info!("focusing");
         } else {
-            s.from = pos;
-            s.visible = !s.visible;
-            s.start = now;
+            s.retarget(!s.visible, now);
             log::info!("{}", if s.visible { "showing" } else { "hiding" });
         }
     }
@@ -279,10 +281,7 @@ fn hide_unfocused() {
         if !s.visible {
             return;
         }
-        let now = Instant::now();
-        s.from = s.position(now).0;
-        s.visible = false;
-        s.start = now;
+        s.retarget(false, Instant::now());
         log::info!("lost focus, hiding");
     }
     wake_all();
@@ -558,7 +557,7 @@ pub fn run(
     config: Config,
     program: &[String],
     start_hidden: bool,
-    duration_ms: u64,
+    anim: Animations,
 ) -> Result<(), SidebarError> {
     // Held (locked) for the lifetime of the process.
     let _pidfile = lock_pidfile(name)?;
@@ -570,13 +569,14 @@ pub fn run(
     uapi::pthread_sigmask(c::SIG_BLOCK, Some(&sigs), None)
         .map_err(|e| SidebarError::Signals(e.into()))?;
 
-    DURATION_MS.store(duration_ms, Relaxed);
     REFOCUS_ENABLED.store(config.focus == Focus::Remap, Relaxed);
     HIDE_ON_UNFOCUS.store(config.hide_on_unfocus, Relaxed);
     *SLIDE.lock().unwrap() = Some(Slide {
         visible: !start_hidden,
         from: if start_hidden { 0.0 } else { 1.0 },
+        velocity: 0.0,
         start: Instant::now(),
+        anim,
     });
 
     let acceptor = Acceptor::new(1000, false).map_err(SidebarError::CreateAcceptor)?;
