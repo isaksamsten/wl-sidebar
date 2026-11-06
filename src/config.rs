@@ -42,8 +42,6 @@ struct Entry {
     #[serde(default = "default_size", deserialize_with = "de_size")]
     size: Size,
     #[serde(default)]
-    peek: u32,
-    #[serde(default)]
     output: Option<String>,
     #[serde(default = "default_true")]
     reserve: bool,
@@ -86,7 +84,7 @@ enum KeyboardInteractivity {
     OnDemand,
 }
 
-/// `false`, `true` (= `"exclusive"`), `"exclusive"` or `"remap"`.
+/// `false`, `true` (picked by [`auto_focus`]), `"exclusive"` or `"remap"`.
 #[derive(Deserialize, Debug, Copy, Clone)]
 #[serde(untagged)]
 enum FocusArg {
@@ -105,6 +103,18 @@ impl Default for FocusArg {
 enum FocusMode {
     Exclusive,
     Remap,
+}
+
+/// The focus strategy for `focus = true`.
+///
+/// `Remap` needs a compositor that focuses `on-demand` layer surfaces when they get
+/// mapped. That's not detectable over Wayland, so it's chosen for compositors known to do
+/// it (niri). Everything else gets `Exclusive`, which works everywhere.
+fn auto_focus(name: &str) -> Focus {
+    let niri = std::env::var_os("NIRI_SOCKET").is_some();
+    let focus = if niri { Focus::Remap } else { Focus::Exclusive };
+    log::debug!("sidebar `{name}`: focus = true -> {focus:?} (niri: {niri})");
+    focus
 }
 
 #[derive(Deserialize, Debug, Default, Copy, Clone)]
@@ -182,12 +192,10 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
     }
     let focus = match entry.focus {
         FocusArg::Bool(false) => Focus::Off,
-        FocusArg::Bool(true) | FocusArg::Mode(FocusMode::Exclusive) => Focus::Exclusive,
+        FocusArg::Bool(true) => auto_focus(&name),
+        FocusArg::Mode(FocusMode::Exclusive) => Focus::Exclusive,
         FocusArg::Mode(FocusMode::Remap) => Focus::Remap,
     };
-    if focus == Focus::Remap && entry.peek > 0 {
-        return Err(SidebarError::RemapPeek(name));
-    }
     let config = Config {
         edge: match entry.edge {
             EdgeArg::Left => Edge::Left,
@@ -196,7 +204,6 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
             EdgeArg::Bottom => Edge::Bottom,
         },
         size: entry.size,
-        peek: entry.peek,
         reserve: entry.reserve,
         keyboard_interactivity: match entry.keyboard_interactivity {
             KeyboardInteractivity::None => ZwlrLayerSurfaceV1KeyboardInteractivity::NONE,

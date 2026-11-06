@@ -22,7 +22,7 @@ use {
         rc::{Rc, Weak},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU64, Ordering::Relaxed},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
         },
         thread,
         time::Instant,
@@ -138,8 +138,6 @@ pub enum Focus {
 pub struct Config {
     pub edge: Edge,
     pub size: Size,
-    /// Pixels that remain on screen when hidden.
-    pub peek: u32,
     /// Whether to reserve space (exclusive zone) while shown.
     pub reserve: bool,
     pub layer: ZwlrLayerShellV1Layer,
@@ -166,6 +164,42 @@ static SLIDE: Mutex<Option<Slide>> = Mutex::new(None);
 static DURATION_MS: AtomicU64 = AtomicU64::new(0);
 /// Eventfds of all client threads, keyed by client id.
 static WAKERS: Mutex<Vec<(usize, Arc<uapi::OwnedFd>)>> = Mutex::new(Vec::new());
+/// `focus = "remap"`: toggling a shown but unfocused sidebar focuses it instead of hiding.
+static REFOCUS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Bumped to ask all client threads to remap their (shown) sidebars to take focus.
+static REFOCUS: AtomicU64 = AtomicU64::new(0);
+/// Number of client keyboards whose focus is on one of the client's surfaces.
+static FOCUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// Keyboard focus of one client `wl_keyboard`, counted in [`FOCUSED`]. Every surface of
+/// the client belongs to the sidebar (toplevels become the sidebar, the rest are popups
+/// and subsurfaces of it), so focus on any of them counts.
+#[derive(Default)]
+pub struct KeyboardFocus(bool);
+
+impl KeyboardFocus {
+    pub fn set(&mut self, focused: bool) {
+        if self.0 == focused {
+            return;
+        }
+        self.0 = focused;
+        if focused {
+            FOCUSED.fetch_add(1, Relaxed);
+        } else {
+            FOCUSED.fetch_sub(1, Relaxed);
+        }
+        log::debug!(
+            "keyboard focus {}",
+            if focused { "entered" } else { "left" }
+        );
+    }
+}
+
+impl Drop for KeyboardFocus {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
 
 impl Slide {
     /// Returns `(position, still_animating)`.
@@ -202,15 +236,23 @@ fn snapshot() -> Snapshot {
     }
 }
 
+/// Shows or hides the sidebar. With `focus = "remap"`, a shown (fully slid in) sidebar
+/// without keyboard focus gets focused instead of hidden.
 pub fn toggle() {
     {
         let mut guard = SLIDE.lock().unwrap();
         let s = guard.as_mut().expect("slide state not initialized");
         let now = Instant::now();
-        s.from = s.position(now).0;
-        s.visible = !s.visible;
-        s.start = now;
-        log::info!("{}", if s.visible { "showing" } else { "hiding" });
+        let (pos, animating) = s.position(now);
+        if REFOCUS_ENABLED.load(Relaxed) && s.visible && !animating && FOCUSED.load(Relaxed) == 0 {
+            REFOCUS.fetch_add(1, Relaxed);
+            log::info!("focusing");
+        } else {
+            s.from = pos;
+            s.visible = !s.visible;
+            s.start = now;
+            log::info!("{}", if s.visible { "showing" } else { "hiding" });
+        }
     }
     for (_, fd) in WAKERS.lock().unwrap().iter() {
         let _ = uapi::eventfd_write(fd.raw(), 1);
@@ -227,8 +269,7 @@ struct Layout {
 }
 
 fn layout(c: &Config, size: u32, s: Snapshot) -> Layout {
-    let travel = size.saturating_sub(c.peek) as f64;
-    let margin = -((1.0 - s.pos) * travel).round() as i32;
+    let margin = -((1.0 - s.pos) * size as f64).round() as i32;
     // Compositors (wlroots, smithay/niri) reserve `exclusive_zone + margin` on the
     // anchored edge. Compensate for the (negative) slide margin so the reserved area is
     // a constant `size` for the whole animation. Otherwise every animation frame changes
@@ -361,10 +402,17 @@ pub fn measured(
     wl_surface.send_commit();
 }
 
+thread_local! {
+    /// Last `REFOCUS` value handled by this thread.
+    static SEEN_REFOCUS: Cell<u64> = Cell::new(REFOCUS.load(Relaxed));
+}
+
 /// Applies the current slide position to all layer surfaces of this thread. Layer-shell
 /// state is double-buffered, so we commit the surface ourselves; otherwise an idle
 /// client would never pick up the change.
 fn update_sidebars(c: &Config, s: Snapshot) {
+    let current = REFOCUS.load(Relaxed);
+    let refocus = SEEN_REFOCUS.with(|seen| seen.replace(current)) != current;
     SIDEBARS.with_borrow_mut(|v| {
         v.retain(|sb| {
             let (Some(layer), Some(wl_surface)) = (sb.layer.upgrade(), sb.wl_surface.upgrade())
@@ -379,6 +427,10 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                 return true; // still measuring
             }
             if let Some(remap) = &sb.remap {
+                // Take focus while shown: unmap, and map again right below.
+                if refocus && s.visible && remap.unmap(&wl_surface) {
+                    sb.applied.set(None);
+                }
                 match remap.phase() {
                     Phase::Unmapped => {
                         if s.visible {
@@ -435,6 +487,7 @@ pub fn run(
         .map_err(|e| SidebarError::Signals(e.into()))?;
 
     DURATION_MS.store(duration_ms, Relaxed);
+    REFOCUS_ENABLED.store(config.focus == Focus::Remap, Relaxed);
     *SLIDE.lock().unwrap() = Some(Slide {
         visible: !start_hidden,
         from: if start_hidden { 0.0 } else { 1.0 },

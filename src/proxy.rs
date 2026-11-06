@@ -7,7 +7,7 @@
 use {
     crate::{
         remap::Remap,
-        sidebar::{self, Config, Focus},
+        sidebar::{self, Config, Focus, KeyboardFocus},
     },
     arrayvec::ArrayVec,
     std::{cell::OnceCell, mem, rc::Rc, sync::Arc},
@@ -32,8 +32,10 @@ use {
                 wl_compositor::{WlCompositor, WlCompositorHandler},
                 wl_display::{WlDisplay, WlDisplayHandler},
                 wl_fixes::WlFixes,
+                wl_keyboard::{WlKeyboard, WlKeyboardHandler},
                 wl_output::{WlOutput, WlOutputHandler},
                 wl_registry::{WlRegistry, WlRegistryHandler},
+                wl_seat::{WlSeat, WlSeatHandler},
                 wl_surface::{WlSurface, WlSurfaceHandler},
             },
             wlr_layer_shell_unstable_v1::{
@@ -207,6 +209,16 @@ struct ClientWlCompositor;
 struct ClientWlSurface {
     /// Set on the sidebar's surface with `focus = "remap"`.
     remap: Option<Rc<Remap>>,
+}
+
+/// Handler for client-created wl_seat objects (only with `focus = "remap"`).
+struct ClientWlSeat;
+
+/// Handler for client-created wl_keyboard objects (only with `focus = "remap"`). Tracks
+/// whether the sidebar has keyboard focus, for `--toggle`.
+#[derive(Default)]
+struct ClientWlKeyboard {
+    focus: KeyboardFocus,
 }
 
 impl WlDisplayHandler for ClientWlDisplay {
@@ -406,6 +418,36 @@ impl WlSurfaceHandler for ClientWlSurface {
     }
 }
 
+impl WlSeatHandler for ClientWlSeat {
+    fn handle_get_keyboard(&mut self, slf: &Rc<WlSeat>, id: &Rc<WlKeyboard>) {
+        id.set_handler(ClientWlKeyboard::default());
+        slf.send_get_keyboard(id);
+    }
+}
+
+impl WlKeyboardHandler for ClientWlKeyboard {
+    fn handle_enter(
+        &mut self,
+        slf: &Rc<WlKeyboard>,
+        serial: u32,
+        surface: &Rc<WlSurface>,
+        keys: &[u8],
+    ) {
+        self.focus.set(true);
+        slf.send_enter(serial, surface, keys);
+    }
+
+    fn handle_leave(&mut self, slf: &Rc<WlKeyboard>, serial: u32, surface: &Rc<WlSurface>) {
+        self.focus.set(false);
+        slf.send_leave(serial, surface);
+    }
+
+    fn handle_release(&mut self, slf: &Rc<WlKeyboard>) {
+        self.focus.set(false);
+        slf.send_release();
+    }
+}
+
 impl WlRegistryHandler for ClientWlRegistry {
     fn handle_bind(&mut self, slf: &Rc<WlRegistry>, name: u32, id: Rc<dyn Object>) {
         match id.interface() {
@@ -432,6 +474,10 @@ impl WlRegistryHandler for ClientWlRegistry {
             {
                 let id = id.downcast::<WlCompositor>();
                 id.set_handler(ClientWlCompositor);
+            }
+            WlSeat::INTERFACE if self.config.focus == Focus::Remap => {
+                let id = id.downcast::<WlSeat>();
+                id.set_handler(ClientWlSeat);
             }
             _ => {}
         }
