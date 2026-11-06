@@ -310,9 +310,24 @@ struct Sidebar {
     wl_surface: Weak<WlSurface>,
     /// Resolved size in pixels; 0 while still measuring.
     size: Cell<u32>,
+    /// The client's minimum size along the sidebar's axis (xdg_toplevel.set_min_size).
+    /// Clients don't shrink below it, so it overrides a smaller `size`.
+    min: Cell<u32>,
+    /// Effective size last sent with set_size.
+    placed: Cell<u32>,
     applied: Cell<Option<Layout>>,
     /// Set with `Focus::Remap`.
     remap: Option<Rc<Remap>>,
+}
+
+impl Sidebar {
+    /// Size actually used: the configured size, grown to the client's minimum.
+    fn effective(&self) -> u32 {
+        match self.size.get() {
+            0 => 0,
+            size => size.max(self.min.get()),
+        }
+    }
 }
 
 thread_local! {
@@ -362,6 +377,8 @@ pub fn register(
             layer: Rc::downgrade(layer),
             wl_surface: Rc::downgrade(wl_surface),
             size: Cell::new(size),
+            min: Cell::new(0),
+            placed: Cell::new(size),
             applied: Cell::new(applied),
             remap,
         })
@@ -389,17 +406,41 @@ pub fn measured(
     };
     let size = ((full as f64 * frac).round() as u32).max(1);
     log::info!("output is {width}x{height}, sidebar size {size}");
-    let l = place(layer, c, size);
     SIDEBARS.with_borrow(|v| {
         if let Some(sb) = v
             .iter()
             .find(|sb| std::ptr::eq(sb.layer.as_ptr(), &**layer))
         {
             sb.size.set(size);
-            sb.applied.set(Some(l));
+            let size = sb.effective();
+            sb.applied.set(Some(place(layer, c, size)));
+            sb.placed.set(size);
         }
     });
     wl_surface.send_commit();
+}
+
+/// Handles xdg_toplevel.set_min_size. The sidebar grows to the client's minimum along
+/// its axis (applied by the next [`update_sidebars`]); otherwise the client draws past
+/// the layer surface, outside the reserved area and the hide distance.
+pub fn set_min_size(layer: &ZwlrLayerSurfaceV1, width: i32, height: i32, c: &Config) {
+    let min = match c.edge {
+        Edge::Left | Edge::Right => width,
+        Edge::Top | Edge::Bottom => height,
+    }
+    .max(0) as u32;
+    SIDEBARS.with_borrow(|v| {
+        if let Some(sb) = v.iter().find(|sb| std::ptr::eq(sb.layer.as_ptr(), layer))
+            && sb.min.replace(min) != min
+            && min > sb.size.get()
+            && sb.size.get() != 0
+        {
+            log::info!(
+                "client minimum size {min} exceeds sidebar size {}, growing",
+                sb.size.get()
+            );
+        }
+    });
 }
 
 thread_local! {
@@ -422,7 +463,7 @@ fn update_sidebars(c: &Config, s: Snapshot) {
             if layer.server_id().is_none() || wl_surface.server_id().is_none() {
                 return false;
             }
-            let size = sb.size.get();
+            let size = sb.effective();
             if size == 0 {
                 return true; // still measuring
             }
@@ -440,6 +481,7 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                                 layer.send_set_layer(c.layer);
                             }
                             sb.applied.set(Some(place(&layer, c, size)));
+                            sb.placed.set(size);
                             wl_surface.send_commit();
                             remap.start_remap();
                         }
@@ -453,6 +495,12 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                     }
                     _ => {}
                 }
+            }
+            if sb.placed.get() != size {
+                sb.applied.set(Some(place(&layer, c, size)));
+                sb.placed.set(size);
+                wl_surface.send_commit();
+                return true;
             }
             let l = layout(c, size, s);
             if sb.applied.get() != Some(l) {

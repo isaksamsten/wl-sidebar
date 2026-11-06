@@ -163,6 +163,7 @@ struct ClientXdgSurface {
 struct ClientXdgToplevel {
     /// The corresponding zwlr_layer_surface_v1.
     zwlr_layer_surface_v1: Rc<ZwlrLayerSurfaceV1>,
+    config: Arc<Config>,
 }
 
 /// Handler for proxy-created zwlr_layer_surface_v1 objects.
@@ -593,6 +594,7 @@ impl XdgSurfaceHandler for ClientXdgSurface {
         id.set_forward_to_server(false);
         id.set_handler(ClientXdgToplevel {
             zwlr_layer_surface_v1: zwlr_layer_surface_v1.clone(),
+            config: self.config.clone(),
         });
         zwlr_layer_surface_v1.set_handler(ProxyZwlrLayerSurfaceV1 {
             xdg_surface: self.xdg_surface.clone(),
@@ -679,6 +681,10 @@ impl XdgToplevelHandler for ClientXdgToplevel {
     fn handle_destroy(&mut self, slf: &Rc<XdgToplevel>) {
         slf.unset_handler();
         self.zwlr_layer_surface_v1.send_destroy();
+    }
+
+    fn handle_set_min_size(&mut self, _slf: &Rc<XdgToplevel>, width: i32, height: i32) {
+        sidebar::set_min_size(&self.zwlr_layer_surface_v1, width, height, &self.config);
     }
 }
 

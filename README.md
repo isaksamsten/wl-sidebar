@@ -36,18 +36,18 @@ If the config defines only one sidebar, the name can be omitted. `--config
 PATH` uses another config file. `wl-sidebar --run [--hidden] NAME` runs a
 sidebar in the foreground instead (useful for debugging or autostart).
 
-| Key                      | Default               |                                                                                                                               |
-| ------------------------ | --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `command`                | (required)            | program + args as an array, or a string run with `sh -c`                                                                      |
-| `edge`                   | `"left"`              | `left\|right\|top\|bottom`                                                                                                    |
-| `size`                   | `400`                 | width (height for top/bottom) in pixels, or a fraction of the output's usable area (`0.5`, `"50%"`; measured once at startup) |
-| `output`                 |                       | pin to this output (e.g. `"DP-1"`)                                                                                            |
-| `reserve`                | `true`                | reserve space; `false` floats over windows                                                                                    |
-| `duration`               | `150`                 | slide animation in ms, `0` = instant                                                                                          |
-| `layer`                  | `"top"`               | `background\|bottom\|top\|overlay`                                                                                            |
-| `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown (always `none` while hidden)                                                         |
-| `focus`                  | `false`               | take keyboard focus on show (see [Focus](#focus))                                                                             |
-| `namespace`              | `"wl-sidebar-<name>"` | layer-shell namespace                                                                                                         |
+| Key                      | Default               |                                                                                                                                                                                 |
+| ------------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`                | (required)            | program + args as an array, or a string run with `sh -c`                                                                                                                        |
+| `edge`                   | `"left"`              | `left\|right\|top\|bottom`                                                                                                                                                      |
+| `size`                   | `400`                 | width (height for top/bottom) in pixels, or a fraction of the output's usable area (`0.5`, `"50%"`; measured once at startup). Grows to the app's minimum size if that's larger |
+| `output`                 |                       | pin to this output (e.g. `"DP-1"`)                                                                                                                                              |
+| `reserve`                | `true`                | reserve space; `false` floats over windows                                                                                                                                      |
+| `duration`               | `150`                 | slide animation in ms, `0` = instant                                                                                                                                            |
+| `layer`                  | `"top"`               | `background\|bottom\|top\|overlay`                                                                                                                                              |
+| `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown (always `none` while hidden)                                                                                                           |
+| `focus`                  | `false`               | take keyboard focus on show (see [Focus](#focus))                                                                                                                               |
+| `namespace`              | `"wl-sidebar-<name>"` | layer-shell namespace                                                                                                                                                           |
 
 niri keybinding example:
 
