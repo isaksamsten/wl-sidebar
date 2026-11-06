@@ -1,5 +1,7 @@
 # wl-sidebar
 
+https://github.com/user-attachments/assets/c24dd00e-fd44-476a-9605-4c92b695e869
+
 Run a Wayland application as a slide-out sidebar, anchored to a screen edge with
 space reserved while shown.
 
