@@ -44,7 +44,8 @@ sidebar in the foreground instead (useful for debugging or autostart).
 | `output`                 |                       | pin to this output (e.g. `"DP-1"`)                                                                                                                                              |
 | `reserve`                | `true`                | reserve space; `false` floats over windows                                                                                                                                      |
 | `animation`              | spring                | slide animation, see [Animation](#animation)                                                                                                                                    |
-| `duration`               |                       | shorthand for an `ease-out-cubic` animation of this many ms, `0` = instant                                                                                                     |
+| `slide`                  | `true`                | slide in/out; `false` keeps the sidebar in place (useful with `fade`)                                                                                                           |
+| `fade`                   | `false`               | fade in/out; needs compositor support for `wp_alpha_modifier_v1`                                                                                                                |
 | `layer`                  | `"top"`               | `background\|bottom\|top\|overlay`                                                                                                                                              |
 | `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown (always `none` while hidden)                                                                                                           |
 | `focus`                  | `false`               | take keyboard focus on show (see [Focus](#focus))                                                                                                                               |
@@ -85,6 +86,12 @@ overshoot = "clamp"
   open a gap at the screen edge. `bounce` (default) reflects off the edge like a
   wall, and `clamp` stops at it. Overshoot while hiding happens offscreen and is
   cut off.
+
+With `fade = true`, the opacity follows the same animation: transparent when
+hidden, opaque when shown. With `slide = false` as well, the sidebar only fades
+and moves offscreen once it's fully transparent. The sidebar and all its
+subsurfaces fade (popups and cursors don't), and the app can't use
+`wp_alpha_modifier_v1` itself while fading is enabled.
 
 ## Focus
 
@@ -127,4 +134,5 @@ proxy's `WAYLAND_DISPLAY`. Some apps don't do that by default:
 
 Hiding animates a _negative margin_ on the anchored edge, so the app keeps its size and
 never re-layouts. The exclusive zone is dropped once fully hidden. Negative-margin
-handling is compositor-specific; if your compositor clamps it, use `duration = 0`.
+handling is compositor-specific; if your compositor clamps it, disable the animation
+with `animation.easing = { duration = 0 }`.

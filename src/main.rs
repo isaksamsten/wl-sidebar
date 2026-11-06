@@ -1,6 +1,7 @@
 mod anim;
 mod cli;
 mod config;
+mod fade;
 mod proxy;
 mod remap;
 mod sidebar;

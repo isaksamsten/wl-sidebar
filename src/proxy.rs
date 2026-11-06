@@ -6,6 +6,7 @@
 
 use {
     crate::{
+        fade::{self, FadeSurface},
         remap::Remap,
         sidebar::{self, Config, Focus, KeyboardFocus},
     },
@@ -17,6 +18,7 @@ use {
         object::{ConcreteObject, Object, ObjectCoreApi, ObjectRcUtils, ObjectUtils},
         protocols::{
             ObjectInterface,
+            alpha_modifier_v1::wp_alpha_modifier_v1::WpAlphaModifierV1,
             org_kde_kwin_server_decoration_v1::{
                 org_kde_kwin_server_decoration::{
                     OrgKdeKwinServerDecoration, OrgKdeKwinServerDecorationHandler,
@@ -36,6 +38,8 @@ use {
                 wl_output::{WlOutput, WlOutputHandler},
                 wl_registry::{WlRegistry, WlRegistryHandler},
                 wl_seat::{WlSeat, WlSeatHandler},
+                wl_subcompositor::{WlSubcompositor, WlSubcompositorHandler},
+                wl_subsurface::{WlSubsurface, WlSubsurfaceHandler},
                 wl_surface::{WlSurface, WlSurfaceHandler},
             },
             wlr_layer_shell_unstable_v1::{
@@ -200,16 +204,29 @@ struct ClientOrgKdeKwinServerDecorationManager;
 
 struct ClientOrgKdeKwinServerDecoration;
 
-/// Handler for client-created wl_compositor objects (with `--output` or
-/// `focus = "remap"`).
-struct ClientWlCompositor;
+/// Handler for client-created wl_compositor objects (with `--output`, `focus = "remap"`
+/// or `fade`).
+struct ClientWlCompositor {
+    fade: bool,
+}
 
-/// Handler for client-created wl_surface objects (with `--output` or `focus = "remap"`).
-/// Drops enter/leave events for the proxy's own wl_output, which the client doesn't know.
+/// Handler for client-created wl_surface objects (with `--output`, `focus = "remap"` or
+/// `fade`). Drops enter/leave events for the proxy's own wl_output, which the client
+/// doesn't know.
 #[derive(Default)]
 struct ClientWlSurface {
     /// Set on the sidebar's surface with `focus = "remap"`.
     remap: Option<Rc<Remap>>,
+    /// Set on every surface with `fade`.
+    fade: Option<Rc<FadeSurface>>,
+}
+
+/// Handler for client-created wl_subcompositor objects (only with `fade`).
+struct ClientWlSubcompositor;
+
+/// Handler for client-created wl_subsurface objects (only with `fade`).
+struct ClientWlSubsurface {
+    fade: Option<Rc<FadeSurface>>,
 }
 
 /// Handler for client-created wl_seat objects (only with `focus = "remap"`).
@@ -283,6 +300,11 @@ impl WlRegistryHandler for ProxyWlRegistry {
                 slf.send_bind(name, proxy.clone());
                 dh.wl_fixes = Some(proxy);
             }
+            WpAlphaModifierV1::INTERFACE if dh.config.fade => {
+                let proxy = slf.state().create_object::<WpAlphaModifierV1>(1);
+                slf.send_bind(name, proxy.clone());
+                fade::set_manager(proxy);
+            }
             WlOutput::INTERFACE if dh.config.output.is_some() => {
                 if version < WlOutput::MSG__NAME__SINCE {
                     log::warn!("ignoring wl_output version {version} without a name");
@@ -324,6 +346,12 @@ impl WlCallbackHandler for ProxyFirstRoundtripWlCallback {
                 ZwlrLayerSurfaceV1::ENM__KEYBOARD_INTERACTIVITY_ON_DEMAND__SINCE,
             );
             std::process::exit(1);
+        }
+        if dh.config.fade && !fade::has_manager() {
+            log::warn!(
+                "server does not support {}, not fading",
+                WpAlphaModifierV1::INTERFACE_NAME,
+            );
         }
         for registry in mem::take(&mut dh.registries_without_handlers) {
             registry.set_handler(ClientWlRegistry {
@@ -382,8 +410,40 @@ impl WlOutputHandler for ProxyWlOutput {
 
 impl WlCompositorHandler for ClientWlCompositor {
     fn handle_create_surface(&mut self, slf: &Rc<WlCompositor>, id: &Rc<WlSurface>) {
-        id.set_handler(ClientWlSurface::default());
+        id.set_handler(ClientWlSurface {
+            fade: (self.fade && fade::has_manager()).then(|| FadeSurface::new(id)),
+            ..Default::default()
+        });
         slf.send_create_surface(id);
+    }
+}
+
+impl WlSubcompositorHandler for ClientWlSubcompositor {
+    fn handle_get_subsurface(
+        &mut self,
+        slf: &Rc<WlSubcompositor>,
+        id: &Rc<WlSubsurface>,
+        surface: &Rc<WlSurface>,
+        parent: &Rc<WlSurface>,
+    ) {
+        let fade = surface
+            .try_get_handler_ref::<ClientWlSurface>()
+            .ok()
+            .and_then(|h| h.fade.clone());
+        if let Some(f) = &fade {
+            f.set_parent(Some(parent));
+        }
+        id.set_handler(ClientWlSubsurface { fade });
+        slf.send_get_subsurface(id, surface, parent);
+    }
+}
+
+impl WlSubsurfaceHandler for ClientWlSubsurface {
+    fn handle_destroy(&mut self, slf: &Rc<WlSubsurface>) {
+        if let Some(f) = &self.fade {
+            f.set_parent(None);
+        }
+        slf.send_destroy();
     }
 }
 
@@ -413,9 +473,19 @@ impl WlSurfaceHandler for ClientWlSurface {
     }
 
     fn handle_commit(&mut self, slf: &Rc<WlSurface>) {
+        if let Some(f) = &self.fade {
+            f.committed();
+        }
         if self.remap.as_ref().is_none_or(|r| r.commit()) {
             slf.send_commit();
         }
+    }
+
+    fn handle_destroy(&mut self, slf: &Rc<WlSurface>) {
+        if let Some(f) = &self.fade {
+            f.destroy();
+        }
+        slf.send_destroy();
     }
 }
 
@@ -471,10 +541,18 @@ impl WlRegistryHandler for ClientWlRegistry {
                 return;
             }
             WlCompositor::INTERFACE
-                if self.config.output.is_some() || self.config.focus == Focus::Remap =>
+                if self.config.output.is_some()
+                    || self.config.focus == Focus::Remap
+                    || self.config.fade =>
             {
                 let id = id.downcast::<WlCompositor>();
-                id.set_handler(ClientWlCompositor);
+                id.set_handler(ClientWlCompositor {
+                    fade: self.config.fade,
+                });
+            }
+            WlSubcompositor::INTERFACE if self.config.fade => {
+                let id = id.downcast::<WlSubcompositor>();
+                id.set_handler(ClientWlSubcompositor);
             }
             WlSeat::INTERFACE if self.config.focus == Focus::Remap => {
                 let id = id.downcast::<WlSeat>();
@@ -514,6 +592,10 @@ impl WlRegistryHandler for ClientWlRegistry {
             // With explicit sync, attaching a buffer requires fresh acquire/release
             // points, so remap could not re-attach the client's buffer.
             ObjectInterface::WpLinuxDrmSyncobjManagerV1 if self.config.focus == Focus::Remap => {
+                self.filter.ignore_global(name);
+            }
+            // We set the alpha multiplier ourselves, and a surface can only have one.
+            ObjectInterface::WpAlphaModifierV1 if self.config.fade => {
                 self.filter.ignore_global(name);
             }
             _ => {

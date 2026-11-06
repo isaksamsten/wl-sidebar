@@ -47,11 +47,12 @@ struct Entry {
     output: Option<String>,
     #[serde(default = "default_true")]
     reserve: bool,
-    /// Legacy shorthand for `animation.easing = { duration = N }`.
-    #[serde(default)]
-    duration: Option<u64>,
     #[serde(default)]
     animation: Option<AnimationArg>,
+    #[serde(default = "default_true")]
+    slide: bool,
+    #[serde(default)]
+    fade: bool,
     #[serde(default)]
     layer: Layer,
     #[serde(default)]
@@ -161,27 +162,10 @@ fn resolve_spec(
     }
 }
 
-fn resolve_animations(
-    duration: Option<u64>,
-    arg: Option<&AnimationArg>,
-) -> Result<Animations, String> {
+fn resolve_animations(arg: Option<&AnimationArg>) -> Result<Animations, String> {
     let Some(arg) = arg else {
-        let Some(ms) = duration else {
-            return Ok(Animations::default());
-        };
-        let a = Animation::Easing {
-            curve: Curve::EaseOutCubic,
-            duration: Duration::from_millis(ms),
-        };
-        return Ok(Animations {
-            show: a,
-            hide: a,
-            ..Animations::default()
-        });
+        return Ok(Animations::default());
     };
-    if duration.is_some() {
-        return Err("give either `duration` or `animation`, not both".into());
-    }
     let base = resolve_spec(&arg.spring, &arg.easing)?.unwrap_or_default();
     let side = |spec: &Option<AnimSpec>, which: &str| -> Result<Animation, String> {
         match spec {
@@ -355,8 +339,10 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
             .unwrap_or_else(|| format!("wl-sidebar-{name}")),
         output: entry.output,
         hide_on_unfocus: entry.hide_on_unfocus,
+        slide: entry.slide,
+        fade: entry.fade,
     };
-    let animations = resolve_animations(entry.duration, entry.animation.as_ref())
+    let animations = resolve_animations(entry.animation.as_ref())
         .map_err(|e| SidebarError::InvalidAnimation(name.clone(), e))?;
     Ok(Sidebar {
         name,
@@ -373,23 +359,12 @@ mod tests {
     fn parse(toml: &str) -> Result<Animations, String> {
         let e: Entry =
             toml::from_str(&format!("command = \"x\"\n{toml}")).map_err(|e| e.to_string())?;
-        resolve_animations(e.duration, e.animation.as_ref())
+        resolve_animations(e.animation.as_ref())
     }
 
     #[test]
     fn default_is_spring() {
         assert_eq!(parse("").unwrap(), Animations::default());
-    }
-
-    #[test]
-    fn legacy_duration() {
-        let a = parse("duration = 0").unwrap();
-        let instant = Animation::Easing {
-            curve: Curve::EaseOutCubic,
-            duration: Duration::ZERO,
-        };
-        assert_eq!((a.show, a.hide), (instant, instant));
-        assert!(parse("duration = 100\nanimation.spring = {}").is_err());
     }
 
     #[test]

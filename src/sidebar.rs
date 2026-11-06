@@ -9,6 +9,7 @@ use {
     crate::{
         SidebarError,
         anim::Animations,
+        fade,
         proxy::{self, ClientWlDisplay},
         remap::{Phase, Remap},
     },
@@ -154,6 +155,10 @@ pub struct Config {
     pub output: Option<String>,
     /// Hide when the sidebar loses keyboard focus.
     pub hide_on_unfocus: bool,
+    /// Slide in and out. Otherwise the sidebar only moves offscreen once fully hidden.
+    pub slide: bool,
+    /// Fade in and out (`wp_alpha_modifier_v1`).
+    pub fade: bool,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -304,7 +309,16 @@ struct Layout {
 }
 
 fn layout(c: &Config, size: u32, s: Snapshot) -> Layout {
-    let margin = -((1.0 - s.pos) * size as f64).round() as i32;
+    // Without sliding, the sidebar stays in place while it fades and only moves
+    // offscreen once fully hidden.
+    let shown = if c.slide {
+        s.pos
+    } else if s.visible || s.pos > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let margin = -((1.0 - shown) * size as f64).round() as i32;
     // Compositors (wlroots, smithay/niri) reserve `exclusive_zone + margin` on the
     // anchored edge. Compensate for the (negative) slide margin so the reserved area is
     // a constant `size` for the whole animation. Otherwise every animation frame changes
@@ -517,6 +531,7 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                             }
                             sb.applied.set(Some(place(&layer, c, size)));
                             sb.placed.set(size);
+                            apply_fade(c, &wl_surface, s);
                             wl_surface.send_commit();
                             remap.start_remap();
                         }
@@ -531,6 +546,7 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                     _ => {}
                 }
             }
+            let faded = apply_fade(c, &wl_surface, s);
             if sb.placed.get() != size {
                 sb.applied.set(Some(place(&layer, c, size)));
                 sb.placed.set(size);
@@ -540,12 +556,20 @@ fn update_sidebars(c: &Config, s: Snapshot) {
             let l = layout(c, size, s);
             if sb.applied.get() != Some(l) {
                 send_layout(&layer, c, l);
-                wl_surface.send_commit();
                 sb.applied.set(Some(l));
+                wl_surface.send_commit();
+            } else if faded {
+                wl_surface.send_commit();
             }
             true
         })
     });
+}
+
+/// Sets the alpha multiplier of the sidebar surface tree for the current position.
+/// Returns whether `wl_surface` must be committed.
+fn apply_fade(c: &Config, wl_surface: &WlSurface, s: Snapshot) -> bool {
+    c.fade && fade::apply(wl_surface, s.pos)
 }
 
 // ---------------------------------------------------------------------------------------
