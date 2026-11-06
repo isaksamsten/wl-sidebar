@@ -47,6 +47,7 @@ sidebar in the foreground instead (useful for debugging or autostart).
 | `layer`                  | `"top"`               | `background\|bottom\|top\|overlay`                                                                                                                                              |
 | `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown (always `none` while hidden)                                                                                                           |
 | `focus`                  | `false`               | take keyboard focus on show (see [Focus](#focus))                                                                                                                               |
+| `hide-on-unfocus`        | `false`               | hide when the sidebar loses keyboard focus (see [Focus](#focus))                                                                                                                |
 | `namespace`              | `"wl-sidebar-<name>"` | layer-shell namespace                                                                                                                                                           |
 
 niri keybinding example:
@@ -69,6 +70,12 @@ hide.
 On other compositors, the sidebar keeps focus until it's hidden.
 
 Without `focus`, click the sidebar to type in it.
+
+With `hide-on-unfocus = true`, the sidebar hides as soon as it loses keyboard
+focus, e.g. when you click another window. It only hides after it had focus, so
+combine it with `focus = true` (or click the sidebar once after showing it).
+On compositors where the sidebar keeps focus until hidden, it can still lose
+focus to e.g. an exclusive launcher on a higher layer.
 
 ## Single-instance apps
 

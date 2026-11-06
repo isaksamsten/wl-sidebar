@@ -25,7 +25,7 @@ use {
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
         },
         thread,
-        time::Instant,
+        time::{Duration, Instant},
     },
     uapi::c,
     wl_proxy::{
@@ -49,6 +49,10 @@ use {
 
 /// Poll timeout while animating (~120 Hz).
 const FRAME_MS: c::c_int = 8;
+/// With `hide_on_unfocus`, how long the sidebar may be without keyboard focus before it
+/// hides. Focus moving between the client's own surfaces (e.g. to a popup) arrives as a
+/// leave followed by an enter; this keeps that from hiding the sidebar.
+const UNFOCUS_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Edge {
@@ -147,6 +151,8 @@ pub struct Config {
     pub namespace: String,
     /// Connector name of the output to pin the sidebar to.
     pub output: Option<String>,
+    /// Hide when the sidebar loses keyboard focus.
+    pub hide_on_unfocus: bool,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -170,6 +176,14 @@ static REFOCUS_ENABLED: AtomicBool = AtomicBool::new(false);
 static REFOCUS: AtomicU64 = AtomicU64::new(0);
 /// Number of client keyboards whose focus is on one of the client's surfaces.
 static FOCUSED: AtomicUsize = AtomicUsize::new(0);
+/// `hide_on_unfocus`: hide the sidebar when [`FOCUSED`] drops to 0.
+static HIDE_ON_UNFOCUS: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Set when this thread saw [`FOCUSED`] drop to 0 with `hide_on_unfocus`. If focus
+    /// is still gone at this time, the sidebar hides.
+    static UNFOCUS_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 
 /// Keyboard focus of one client `wl_keyboard`, counted in [`FOCUSED`]. Every surface of
 /// the client belongs to the sidebar (toplevels become the sidebar, the rest are popups
@@ -185,8 +199,8 @@ impl KeyboardFocus {
         self.0 = focused;
         if focused {
             FOCUSED.fetch_add(1, Relaxed);
-        } else {
-            FOCUSED.fetch_sub(1, Relaxed);
+        } else if FOCUSED.fetch_sub(1, Relaxed) == 1 && HIDE_ON_UNFOCUS.load(Relaxed) {
+            UNFOCUS_DEADLINE.set(Some(Instant::now() + UNFOCUS_GRACE));
         }
         log::debug!(
             "keyboard focus {}",
@@ -254,6 +268,28 @@ pub fn toggle() {
             log::info!("{}", if s.visible { "showing" } else { "hiding" });
         }
     }
+    wake_all();
+}
+
+/// Hides the sidebar after it lost keyboard focus (`hide_on_unfocus`).
+fn hide_unfocused() {
+    {
+        let mut guard = SLIDE.lock().unwrap();
+        let s = guard.as_mut().expect("slide state not initialized");
+        if !s.visible {
+            return;
+        }
+        let now = Instant::now();
+        s.from = s.position(now).0;
+        s.visible = false;
+        s.start = now;
+        log::info!("lost focus, hiding");
+    }
+    wake_all();
+}
+
+/// Wakes all client threads to apply a changed slide state.
+fn wake_all() {
     for (_, fd) in WAKERS.lock().unwrap().iter() {
         let _ = uapi::eventfd_write(fd.raw(), 1);
     }
@@ -536,6 +572,7 @@ pub fn run(
 
     DURATION_MS.store(duration_ms, Relaxed);
     REFOCUS_ENABLED.store(config.focus == Focus::Remap, Relaxed);
+    HIDE_ON_UNFOCUS.store(config.hide_on_unfocus, Relaxed);
     *SLIDE.lock().unwrap() = Some(Slide {
         visible: !start_hidden,
         from: if start_hidden { 0.0 } else { 1.0 },
@@ -616,6 +653,14 @@ fn run_client(id: usize, socket: OwnedFd, config: &Arc<Config>) -> Result<(), Si
         .set_handler(ClientWlDisplay::new(config.clone()));
 
     while state.is_not_destroyed() {
+        if let Some(deadline) = UNFOCUS_DEADLINE.get()
+            && Instant::now() >= deadline
+        {
+            UNFOCUS_DEADLINE.set(None);
+            if FOCUSED.load(Relaxed) == 0 {
+                hide_unfocused();
+            }
+        }
         let snap = snapshot();
         update_sidebars(config, snap);
         state.before_poll().map_err(SidebarError::Dispatch)?;
@@ -631,7 +676,14 @@ fn run_client(id: usize, socket: OwnedFd, config: &Arc<Config>) -> Result<(), Si
                 revents: 0,
             },
         ];
-        let timeout = if snap.animating { FRAME_MS } else { -1 };
+        let mut timeout = if snap.animating { FRAME_MS } else { -1 };
+        if let Some(deadline) = UNFOCUS_DEADLINE.get() {
+            let ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .saturating_add(1) as c::c_int;
+            timeout = if timeout < 0 { ms } else { timeout.min(ms) };
+        }
         if let Err(e) = uapi::poll(&mut fds, timeout)
             && e.0 != c::EINTR
         {

@@ -53,6 +53,8 @@ struct Entry {
     keyboard_interactivity: KeyboardInteractivity,
     #[serde(default)]
     focus: FocusArg,
+    #[serde(default)]
+    hide_on_unfocus: bool,
     /// Default: `wl-sidebar-<name>`.
     #[serde(default)]
     namespace: Option<String>,
@@ -221,6 +223,7 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
             .namespace
             .unwrap_or_else(|| format!("wl-sidebar-{name}")),
         output: entry.output,
+        hide_on_unfocus: entry.hide_on_unfocus,
     };
     Ok(Sidebar {
         name,
