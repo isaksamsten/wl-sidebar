@@ -10,7 +10,7 @@
 use {
     crate::{
         SidebarError,
-        sidebar::{Config, Edge, Size},
+        sidebar::{Config, Edge, Focus, Size},
     },
     serde::{Deserialize, Deserializer, de::Error as _},
     std::{
@@ -54,7 +54,7 @@ struct Entry {
     #[serde(default)]
     keyboard_interactivity: KeyboardInteractivity,
     #[serde(default)]
-    focus: bool,
+    focus: FocusArg,
     /// Default: `wl-sidebar-<name>`.
     #[serde(default)]
     namespace: Option<String>,
@@ -84,6 +84,27 @@ enum KeyboardInteractivity {
     Exclusive,
     #[default]
     OnDemand,
+}
+
+/// `false`, `true` (= `"exclusive"`), `"exclusive"` or `"remap"`.
+#[derive(Deserialize, Debug, Copy, Clone)]
+#[serde(untagged)]
+enum FocusArg {
+    Bool(bool),
+    Mode(FocusMode),
+}
+
+impl Default for FocusArg {
+    fn default() -> Self {
+        Self::Bool(false)
+    }
+}
+
+#[derive(Deserialize, Debug, Copy, Clone)]
+#[serde(rename_all = "kebab-case")]
+enum FocusMode {
+    Exclusive,
+    Remap,
 }
 
 #[derive(Deserialize, Debug, Default, Copy, Clone)]
@@ -159,6 +180,14 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
     if command.is_empty() {
         return Err(SidebarError::EmptyCommand(name));
     }
+    let focus = match entry.focus {
+        FocusArg::Bool(false) => Focus::Off,
+        FocusArg::Bool(true) | FocusArg::Mode(FocusMode::Exclusive) => Focus::Exclusive,
+        FocusArg::Mode(FocusMode::Remap) => Focus::Remap,
+    };
+    if focus == Focus::Remap && entry.peek > 0 {
+        return Err(SidebarError::RemapPeek(name));
+    }
     let config = Config {
         edge: match entry.edge {
             EdgeArg::Left => Edge::Left,
@@ -180,7 +209,7 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
             Layer::Top => ZwlrLayerShellV1Layer::TOP,
             Layer::Overlay => ZwlrLayerShellV1Layer::OVERLAY,
         },
-        focus: entry.focus,
+        focus,
         namespace: entry
             .namespace
             .unwrap_or_else(|| format!("wl-sidebar-{name}")),
@@ -193,4 +222,3 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
         duration: entry.duration,
     })
 }
-

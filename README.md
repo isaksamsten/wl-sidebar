@@ -47,7 +47,7 @@ sidebar in the foreground instead (useful for debugging or autostart).
 | `duration`               | `150`                 | slide animation in ms, `0` = instant                                                                                          |
 | `layer`                  | `"top"`               | `background\|bottom\|top\|overlay`                                                                                            |
 | `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown (always `none` while hidden)                                                         |
-| `focus`                  | `false`               | take keyboard focus on show, keep it until hidden                                                                             |
+| `focus`                  | `false`               | take keyboard focus on show: `true`/`"exclusive"` keeps it until hidden, `"remap"` see [Focus](#focus)                        |
 | `namespace`              | `"wl-sidebar-<name>"` | layer-shell namespace                                                                                                         |
 
 niri keybinding example:
@@ -67,6 +67,12 @@ reliable way to grab focus: niri gives `on-demand` layer surfaces focus only on
 click, not on request.
 
 Without `focus`, the sidebar is `on-demand`: click it to type in it.
+
+`focus = "remap"` (experimental) is the Ghostty quick-terminal approach: the sidebar stays
+`on-demand`, but it is unmapped once fully hidden and mapped again on show. niri focuses newly
+mapped `on-demand` surfaces, so it gets focus on show and you can still click away from it.
+The proxy re-attaches the app's last buffer, so the app doesn't notice. Requires `peek = 0`,
+and it hides explicit sync (`wp_linux_drm_syncobj`) from the app.
 
 ## How hiding works
 

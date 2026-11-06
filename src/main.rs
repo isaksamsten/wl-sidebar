@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod proxy;
+mod remap;
 mod sidebar;
 
 use {
@@ -31,6 +32,8 @@ enum SidebarError {
     Dispatch(#[source] StateError),
     #[error("poll failed")]
     Poll(#[source] io::Error),
+    #[error("sidebar `{0}`: focus = \"remap\" requires peek = 0")]
+    RemapPeek(String),
     #[error("XDG_RUNTIME_DIR is not set")]
     NoRuntimeDir,
     #[error("neither XDG_CONFIG_HOME nor HOME is set")]
@@ -66,4 +69,3 @@ fn main() -> Result<(), Report<SidebarError>> {
         .init();
     cli::main().map_err(Report::new)
 }
-

@@ -5,7 +5,10 @@
 //! one edge and registers it with the slide state so it can be shown/hidden.
 
 use {
-    crate::sidebar::{self, Config},
+    crate::{
+        remap::Remap,
+        sidebar::{self, Config, Focus},
+    },
     arrayvec::ArrayVec,
     std::{cell::OnceCell, mem, rc::Rc, sync::Arc},
     wl_proxy::{
@@ -24,6 +27,7 @@ use {
                 },
             },
             wayland::{
+                wl_buffer::WlBuffer,
                 wl_callback::{WlCallback, WlCallbackHandler},
                 wl_compositor::{WlCompositor, WlCompositorHandler},
                 wl_display::{WlDisplay, WlDisplayHandler},
@@ -168,6 +172,7 @@ struct ProxyZwlrLayerSurfaceV1 {
     /// The next configure only reports the available output area (relative `--size`)
     /// and must not be forwarded to the client.
     measuring: bool,
+    remap: Option<Rc<Remap>>,
 }
 
 /// Handler for client-created xdg_positioner objects.
@@ -192,12 +197,17 @@ struct ClientOrgKdeKwinServerDecorationManager;
 
 struct ClientOrgKdeKwinServerDecoration;
 
-/// Handler for client-created wl_compositor objects (only with `--output`).
+/// Handler for client-created wl_compositor objects (with `--output` or
+/// `focus = "remap"`).
 struct ClientWlCompositor;
 
-/// Handler for client-created wl_surface objects (only with `--output`). Drops
-/// enter/leave events for the proxy's own wl_output, which the client doesn't know.
-struct ClientWlSurface;
+/// Handler for client-created wl_surface objects (with `--output` or `focus = "remap"`).
+/// Drops enter/leave events for the proxy's own wl_output, which the client doesn't know.
+#[derive(Default)]
+struct ClientWlSurface {
+    /// Set on the sidebar's surface with `focus = "remap"`.
+    remap: Option<Rc<Remap>>,
+}
 
 impl WlDisplayHandler for ClientWlDisplay {
     fn handle_get_registry(&mut self, slf: &Rc<WlDisplay>, registry: &Rc<WlRegistry>) {
@@ -359,7 +369,7 @@ impl WlOutputHandler for ProxyWlOutput {
 
 impl WlCompositorHandler for ClientWlCompositor {
     fn handle_create_surface(&mut self, slf: &Rc<WlCompositor>, id: &Rc<WlSurface>) {
-        id.set_handler(ClientWlSurface);
+        id.set_handler(ClientWlSurface::default());
         slf.send_create_surface(id);
     }
 }
@@ -374,6 +384,24 @@ impl WlSurfaceHandler for ClientWlSurface {
     fn handle_leave(&mut self, slf: &Rc<WlSurface>, output: &Rc<WlOutput>) {
         if output.client().is_some() {
             slf.send_leave(output);
+        }
+    }
+
+    fn handle_attach(
+        &mut self,
+        slf: &Rc<WlSurface>,
+        buffer: Option<&Rc<WlBuffer>>,
+        x: i32,
+        y: i32,
+    ) {
+        if self.remap.as_ref().is_none_or(|r| r.attach(buffer)) {
+            slf.send_attach(buffer, x, y);
+        }
+    }
+
+    fn handle_commit(&mut self, slf: &Rc<WlSurface>) {
+        if self.remap.as_ref().is_none_or(|r| r.commit()) {
+            slf.send_commit();
         }
     }
 }
@@ -399,7 +427,9 @@ impl WlRegistryHandler for ClientWlRegistry {
                 id.set_handler(ClientOrgKdeKwinServerDecorationManager);
                 return;
             }
-            WlCompositor::INTERFACE if self.config.output.is_some() => {
+            WlCompositor::INTERFACE
+                if self.config.output.is_some() || self.config.focus == Focus::Remap =>
+            {
                 let id = id.downcast::<WlCompositor>();
                 id.set_handler(ClientWlCompositor);
             }
@@ -432,6 +462,11 @@ impl WlRegistryHandler for ClientWlRegistry {
             | ObjectInterface::XdgToplevelDragManagerV1
             | ObjectInterface::XdgToplevelIconManagerV1
             | ObjectInterface::XdgToplevelTagManagerV1 => {
+                self.filter.ignore_global(name);
+            }
+            // With explicit sync, attaching a buffer requires fresh acquire/release
+            // points, so remap could not re-attach the client's buffer.
+            ObjectInterface::WpLinuxDrmSyncobjManagerV1 if self.config.focus == Focus::Remap => {
                 self.filter.ignore_global(name);
             }
             _ => {
@@ -498,7 +533,14 @@ impl XdgSurfaceHandler for ClientXdgSurface {
         );
         // Sets size, anchor, margin, exclusive zone and keyboard interactivity. The
         // client's initial commit applies them.
-        let measuring = sidebar::register(&zwlr_layer_surface_v1, &self.wl_surface, c);
+        let remap = (c.focus == Focus::Remap).then(Remap::new);
+        if let Some(remap) = &remap
+            && let Ok(mut h) = self.wl_surface.try_get_handler_mut::<ClientWlSurface>()
+        {
+            h.remap = Some(remap.clone());
+        }
+        let measuring =
+            sidebar::register(&zwlr_layer_surface_v1, &self.wl_surface, remap.clone(), c);
         if id.version() >= XdgToplevel::MSG__WM_CAPABILITIES__SINCE {
             id.send_wm_capabilities(&[]);
         }
@@ -512,6 +554,7 @@ impl XdgSurfaceHandler for ClientXdgSurface {
             wl_surface: self.wl_surface.clone(),
             config: self.config.clone(),
             measuring,
+            remap,
         });
         self.zwlr_layer_surface_v1 = Some(zwlr_layer_surface_v1.clone());
     }
@@ -610,6 +653,11 @@ impl ZwlrLayerSurfaceV1Handler for ProxyZwlrLayerSurfaceV1 {
             self.measuring = false;
             slf.send_ack_configure(serial);
             sidebar::measured(slf, &self.wl_surface, width, height, &self.config);
+            return;
+        }
+        if let Some(remap) = &self.remap
+            && remap.configure(slf, &self.wl_surface, serial, width, height)
+        {
             return;
         }
         let mut states = ArrayVec::<_, 9>::new();

@@ -6,7 +6,11 @@
 //! eventfd and re-applies margin/exclusive-zone to the layer surfaces it owns.
 
 use {
-    crate::{SidebarError, proxy::{self, ClientWlDisplay}},
+    crate::{
+        SidebarError,
+        proxy::{self, ClientWlDisplay},
+        remap::{Phase, Remap},
+    },
     error_reporter::Report,
     std::{
         cell::{Cell, RefCell},
@@ -104,7 +108,9 @@ impl std::str::FromStr for Size {
         } else if s.contains('.') {
             s.parse::<f64>().map_err(|e| e.to_string())?
         } else {
-            let px: u32 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            let px: u32 = s
+                .parse()
+                .map_err(|e: std::num::ParseIntError| e.to_string())?;
             if px == 0 {
                 return Err("size must be > 0".into());
             }
@@ -117,6 +123,18 @@ impl std::str::FromStr for Size {
     }
 }
 
+/// How to take keyboard focus on show.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Focus {
+    /// Don't; use `keyboard_interactivity`.
+    Off,
+    /// `EXCLUSIVE` interactivity while shown.
+    Exclusive,
+    /// `ON_DEMAND` interactivity, unmapped while hidden and mapped again on show (see
+    /// `remap`).
+    Remap,
+}
+
 pub struct Config {
     pub edge: Edge,
     pub size: Size,
@@ -125,10 +143,9 @@ pub struct Config {
     /// Whether to reserve space (exclusive zone) while shown.
     pub reserve: bool,
     pub layer: ZwlrLayerShellV1Layer,
-    /// Interactivity while shown (when not `focus`). Always `NONE` while hidden.
+    /// Interactivity while shown (when `focus` is `Off`). Always `NONE` while hidden.
     pub keyboard_interactivity: ZwlrLayerSurfaceV1KeyboardInteractivity,
-    /// Grab keyboard focus while shown (`EXCLUSIVE` interactivity).
-    pub focus: bool,
+    pub focus: Focus,
     pub namespace: String,
     /// Connector name of the output to pin the sidebar to.
     pub output: Option<String>,
@@ -229,10 +246,12 @@ fn layout(c: &Config, size: u32, s: Snapshot) -> Layout {
     // keystrokes don't go to an invisible terminal.
     let keyboard_interactivity = if !s.visible {
         ZwlrLayerSurfaceV1KeyboardInteractivity::NONE
-    } else if c.focus {
-        ZwlrLayerSurfaceV1KeyboardInteractivity::EXCLUSIVE
     } else {
-        c.keyboard_interactivity
+        match c.focus {
+            Focus::Off => c.keyboard_interactivity,
+            Focus::Exclusive => ZwlrLayerSurfaceV1KeyboardInteractivity::EXCLUSIVE,
+            Focus::Remap => ZwlrLayerSurfaceV1KeyboardInteractivity::ON_DEMAND,
+        }
     };
     Layout {
         margin,
@@ -251,6 +270,8 @@ struct Sidebar {
     /// Resolved size in pixels; 0 while still measuring.
     size: Cell<u32>,
     applied: Cell<Option<Layout>>,
+    /// Set with `Focus::Remap`.
+    remap: Option<Rc<Remap>>,
 }
 
 thread_local! {
@@ -280,7 +301,12 @@ fn place(layer: &ZwlrLayerSurfaceV1, c: &Config, size: u32) -> Layout {
 /// Returns `true` if the size is relative. The surface is then first stretched over the
 /// whole output so that the compositor's first configure reports the available area;
 /// see [`measured`].
-pub fn register(layer: &Rc<ZwlrLayerSurfaceV1>, wl_surface: &Rc<WlSurface>, c: &Config) -> bool {
+pub fn register(
+    layer: &Rc<ZwlrLayerSurfaceV1>,
+    wl_surface: &Rc<WlSurface>,
+    remap: Option<Rc<Remap>>,
+    c: &Config,
+) -> bool {
     let (size, applied) = match c.size {
         Size::Pixels(px) => (px, Some(place(layer, c, px))),
         Size::Fraction(_) => {
@@ -296,6 +322,7 @@ pub fn register(layer: &Rc<ZwlrLayerSurfaceV1>, wl_surface: &Rc<WlSurface>, c: &
             wl_surface: Rc::downgrade(wl_surface),
             size: Cell::new(size),
             applied: Cell::new(applied),
+            remap,
         })
     });
     size == 0
@@ -323,7 +350,10 @@ pub fn measured(
     log::info!("output is {width}x{height}, sidebar size {size}");
     let l = place(layer, c, size);
     SIDEBARS.with_borrow(|v| {
-        if let Some(sb) = v.iter().find(|sb| std::ptr::eq(sb.layer.as_ptr(), &**layer)) {
+        if let Some(sb) = v
+            .iter()
+            .find(|sb| std::ptr::eq(sb.layer.as_ptr(), &**layer))
+        {
             sb.size.set(size);
             sb.applied.set(Some(l));
         }
@@ -347,6 +377,30 @@ fn update_sidebars(c: &Config, s: Snapshot) {
             let size = sb.size.get();
             if size == 0 {
                 return true; // still measuring
+            }
+            if let Some(remap) = &sb.remap {
+                match remap.phase() {
+                    Phase::Unmapped => {
+                        if s.visible {
+                            // Unmapping reset all layer state; send all of it again.
+                            // Some smithay versions also reset the layer (to `background`).
+                            if layer.version() >= ZwlrLayerSurfaceV1::MSG__SET_LAYER__SINCE {
+                                layer.send_set_layer(c.layer);
+                            }
+                            sb.applied.set(Some(place(&layer, c, size)));
+                            wl_surface.send_commit();
+                            remap.start_remap();
+                        }
+                        // Committing while unmapped would trigger a configure for the
+                        // reset (invalid) state.
+                        return true;
+                    }
+                    Phase::Mapped if !s.visible && !s.animating && remap.unmap(&wl_surface) => {
+                        sb.applied.set(None);
+                        return true;
+                    }
+                    _ => {}
+                }
             }
             let l = layout(c, size, s);
             if sb.applied.get() != Some(l) {
@@ -396,13 +450,15 @@ pub fn run(
 
     thread::Builder::new()
         .name("signals".into())
-        .spawn(move || loop {
-            match uapi::sigwait(&sigs) {
-                Ok(c::SIGUSR1) => toggle(),
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("sigwait failed: {}", Report::new(std::io::Error::from(e)));
-                    return;
+        .spawn(move || {
+            loop {
+                match uapi::sigwait(&sigs) {
+                    Ok(c::SIGUSR1) => toggle(),
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("sigwait failed: {}", Report::new(std::io::Error::from(e)));
+                        return;
+                    }
                 }
             }
         })
@@ -551,4 +607,3 @@ pub fn send_toggle(name: &str) -> Result<bool, SidebarError> {
     uapi::kill(pid, c::SIGUSR1).map_err(|e| SidebarError::Kill(e.into()))?;
     Ok(true)
 }
-

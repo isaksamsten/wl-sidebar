@@ -62,4 +62,3 @@ pub fn main() -> Result<(), SidebarError> {
     cmd.spawn().map_err(SidebarError::SpawnDaemon)?;
     Ok(())
 }
-
