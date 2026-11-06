@@ -1,0 +1,16 @@
+[package]
+name = "wl-sidebar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrayvec = "0.7.8"
+clap = { version = "4.6.7", features = ["derive"] }
+env_logger = "0.11.11"
+error_reporter = "1.0.0"
+log = "0.4.35"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+toml = "1.2.1"
+uapi = "0.2.14"
+wl-proxy = { version = "0.1.5", features = ["suite-wayland-protocols", "suite-wlr-protocols", "protocol-org_kde_kwin_server_decoration_v1"] }

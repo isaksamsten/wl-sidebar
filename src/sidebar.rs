@@ -1,0 +1,554 @@
+//! Sidebar placement, slide animation, and the proxy event loop.
+//!
+//! Threading model (same as wl-proxy's `SimpleProxy`): every client connection gets its
+//! own thread with its own `State` (= its own connection to the real compositor). The
+//! slide state is global; when it changes, every client thread is woken through an
+//! eventfd and re-applies margin/exclusive-zone to the layer surfaces it owns.
+
+use {
+    crate::{SidebarError, proxy::{self, ClientWlDisplay}},
+    error_reporter::Report,
+    std::{
+        cell::{Cell, RefCell},
+        fs::{self, File, OpenOptions},
+        io::{ErrorKind, Write},
+        os::fd::{AsRawFd, OwnedFd},
+        path::PathBuf,
+        process::Command,
+        rc::{Rc, Weak},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering::Relaxed},
+        },
+        thread,
+        time::Instant,
+    },
+    uapi::c,
+    wl_proxy::{
+        acceptor::Acceptor,
+        client::ClientHandler,
+        object::ObjectCoreApi,
+        protocols::{
+            wayland::wl_surface::WlSurface,
+            wlr_layer_shell_unstable_v1::{
+                zwlr_layer_shell_v1::ZwlrLayerShellV1Layer,
+                zwlr_layer_surface_v1::{
+                    ZwlrLayerSurfaceV1, ZwlrLayerSurfaceV1Anchor,
+                    ZwlrLayerSurfaceV1KeyboardInteractivity,
+                },
+            },
+        },
+        simple::SimpleCommandExt,
+        state::{Destructor, State},
+    },
+};
+
+/// Poll timeout while animating (~120 Hz).
+const FRAME_MS: c::c_int = 8;
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    pub fn anchor(self) -> ZwlrLayerSurfaceV1Anchor {
+        use ZwlrLayerSurfaceV1Anchor as A;
+        match self {
+            Edge::Left => A::TOP | A::BOTTOM | A::LEFT,
+            Edge::Right => A::TOP | A::BOTTOM | A::RIGHT,
+            Edge::Top => A::LEFT | A::RIGHT | A::TOP,
+            Edge::Bottom => A::LEFT | A::RIGHT | A::BOTTOM,
+        }
+    }
+
+    /// Layer surface size; 0 on the axis that is stretched between two anchors.
+    fn size(self, size: u32) -> (u32, u32) {
+        match self {
+            Edge::Left | Edge::Right => (size, 0),
+            Edge::Top | Edge::Bottom => (0, size),
+        }
+    }
+
+    /// `[top, right, bottom, left]` with `m` applied to the anchored edge.
+    fn margins(self, m: i32) -> [i32; 4] {
+        match self {
+            Edge::Top => [m, 0, 0, 0],
+            Edge::Right => [0, m, 0, 0],
+            Edge::Bottom => [0, 0, m, 0],
+            Edge::Left => [0, 0, 0, m],
+        }
+    }
+}
+
+/// Sidebar thickness: width for left/right, height for top/bottom.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Size {
+    Pixels(u32),
+    /// Fraction (0, 1] of the available output area, measured from the compositor's
+    /// first configure.
+    Fraction(f64),
+}
+
+impl std::str::FromStr for Size {
+    type Err = String;
+
+    /// `400` = pixels, `0.5` or `50%` = fraction of the output.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let frac = if let Some(p) = s.strip_suffix('%') {
+            p.trim().parse::<f64>().map_err(|e| e.to_string())? / 100.0
+        } else if s.contains('.') {
+            s.parse::<f64>().map_err(|e| e.to_string())?
+        } else {
+            let px: u32 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+            if px == 0 {
+                return Err("size must be > 0".into());
+            }
+            return Ok(Size::Pixels(px));
+        };
+        if !(frac > 0.0 && frac <= 1.0) {
+            return Err("fraction must be in (0, 1] / (0%, 100%]".into());
+        }
+        Ok(Size::Fraction(frac))
+    }
+}
+
+pub struct Config {
+    pub edge: Edge,
+    pub size: Size,
+    /// Pixels that remain on screen when hidden.
+    pub peek: u32,
+    /// Whether to reserve space (exclusive zone) while shown.
+    pub reserve: bool,
+    pub layer: ZwlrLayerShellV1Layer,
+    /// Interactivity while shown (when not `focus`). Always `NONE` while hidden.
+    pub keyboard_interactivity: ZwlrLayerSurfaceV1KeyboardInteractivity,
+    /// Grab keyboard focus while shown (`EXCLUSIVE` interactivity).
+    pub focus: bool,
+    pub namespace: String,
+    /// Connector name of the output to pin the sidebar to.
+    pub output: Option<String>,
+}
+
+// ---------------------------------------------------------------------------------------
+// Global slide state
+// ---------------------------------------------------------------------------------------
+
+struct Slide {
+    visible: bool,
+    /// Position at `start`. 1.0 = fully shown, 0.0 = fully hidden.
+    from: f64,
+    start: Instant,
+}
+
+static SLIDE: Mutex<Option<Slide>> = Mutex::new(None);
+static DURATION_MS: AtomicU64 = AtomicU64::new(0);
+/// Eventfds of all client threads, keyed by client id.
+static WAKERS: Mutex<Vec<(usize, Arc<uapi::OwnedFd>)>> = Mutex::new(Vec::new());
+
+impl Slide {
+    /// Returns `(position, still_animating)`.
+    fn position(&self, now: Instant) -> (f64, bool) {
+        let target = if self.visible { 1.0 } else { 0.0 };
+        let dur = DURATION_MS.load(Relaxed);
+        if dur == 0 {
+            return (target, false);
+        }
+        let t = now.saturating_duration_since(self.start).as_secs_f64() * 1000.0 / dur as f64;
+        if t >= 1.0 {
+            return (target, false);
+        }
+        let eased = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+        (self.from + (target - self.from) * eased, true)
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Snapshot {
+    pos: f64,
+    visible: bool,
+    animating: bool,
+}
+
+fn snapshot() -> Snapshot {
+    let guard = SLIDE.lock().unwrap();
+    let s = guard.as_ref().expect("slide state not initialized");
+    let (pos, animating) = s.position(Instant::now());
+    Snapshot {
+        pos,
+        visible: s.visible,
+        animating,
+    }
+}
+
+pub fn toggle() {
+    {
+        let mut guard = SLIDE.lock().unwrap();
+        let s = guard.as_mut().expect("slide state not initialized");
+        let now = Instant::now();
+        s.from = s.position(now).0;
+        s.visible = !s.visible;
+        s.start = now;
+        log::info!("{}", if s.visible { "showing" } else { "hiding" });
+    }
+    for (_, fd) in WAKERS.lock().unwrap().iter() {
+        let _ = uapi::eventfd_write(fd.raw(), 1);
+    }
+}
+
+/// Layer-surface state for one slide position.
+#[derive(Copy, Clone, PartialEq)]
+struct Layout {
+    /// Margin on the anchored edge.
+    margin: i32,
+    exclusive_zone: i32,
+    keyboard_interactivity: ZwlrLayerSurfaceV1KeyboardInteractivity,
+}
+
+fn layout(c: &Config, size: u32, s: Snapshot) -> Layout {
+    let travel = size.saturating_sub(c.peek) as f64;
+    let margin = -((1.0 - s.pos) * travel).round() as i32;
+    // Compositors (wlroots, smithay/niri) reserve `exclusive_zone + margin` on the
+    // anchored edge. Compensate for the (negative) slide margin so the reserved area is
+    // a constant `size` for the whole animation. Otherwise every animation frame changes
+    // the work area and all tiled windows resize (and re-render) every frame.
+    //
+    // Reserve as soon as showing starts (windows resize once, then the sidebar slides
+    // into the gap) and keep it until fully hidden (one resize at the end).
+    let exclusive_zone = if c.reserve && (s.visible || s.pos > 0.0) {
+        size as i32 - margin
+    } else {
+        0
+    };
+    // Focus changes immediately on toggle, not at the end of the animation. While
+    // hidden, `NONE` also drops any on-demand focus the sidebar had from a click, so
+    // keystrokes don't go to an invisible terminal.
+    let keyboard_interactivity = if !s.visible {
+        ZwlrLayerSurfaceV1KeyboardInteractivity::NONE
+    } else if c.focus {
+        ZwlrLayerSurfaceV1KeyboardInteractivity::EXCLUSIVE
+    } else {
+        c.keyboard_interactivity
+    };
+    Layout {
+        margin,
+        exclusive_zone,
+        keyboard_interactivity,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Per-thread layer surfaces
+// ---------------------------------------------------------------------------------------
+
+struct Sidebar {
+    layer: Weak<ZwlrLayerSurfaceV1>,
+    wl_surface: Weak<WlSurface>,
+    /// Resolved size in pixels; 0 while still measuring.
+    size: Cell<u32>,
+    applied: Cell<Option<Layout>>,
+}
+
+thread_local! {
+    static SIDEBARS: RefCell<Vec<Sidebar>> = const { RefCell::new(Vec::new()) };
+}
+
+fn send_layout(layer: &ZwlrLayerSurfaceV1, c: &Config, l: Layout) {
+    let [t, r, b, left] = c.edge.margins(l.margin);
+    layer.send_set_margin(t, r, b, left);
+    layer.send_set_exclusive_zone(l.exclusive_zone);
+    layer.send_set_keyboard_interactivity(l.keyboard_interactivity);
+}
+
+/// Places the sidebar at its edge with the given pixel size and current slide position.
+fn place(layer: &ZwlrLayerSurfaceV1, c: &Config, size: u32) -> Layout {
+    let (w, h) = c.edge.size(size);
+    layer.send_set_size(w, h);
+    layer.send_set_anchor(c.edge.anchor());
+    let l = layout(c, size, snapshot());
+    send_layout(layer, c, l);
+    l
+}
+
+/// Called from `get_toplevel` for every new layer surface. Does not commit; the
+/// client's initial commit applies the state.
+///
+/// Returns `true` if the size is relative. The surface is then first stretched over the
+/// whole output so that the compositor's first configure reports the available area;
+/// see [`measured`].
+pub fn register(layer: &Rc<ZwlrLayerSurfaceV1>, wl_surface: &Rc<WlSurface>, c: &Config) -> bool {
+    let (size, applied) = match c.size {
+        Size::Pixels(px) => (px, Some(place(layer, c, px))),
+        Size::Fraction(_) => {
+            use ZwlrLayerSurfaceV1Anchor as A;
+            layer.send_set_size(0, 0);
+            layer.send_set_anchor(A::TOP | A::BOTTOM | A::LEFT | A::RIGHT);
+            (0, None)
+        }
+    };
+    SIDEBARS.with_borrow_mut(|v| {
+        v.push(Sidebar {
+            layer: Rc::downgrade(layer),
+            wl_surface: Rc::downgrade(wl_surface),
+            size: Cell::new(size),
+            applied: Cell::new(applied),
+        })
+    });
+    size == 0
+}
+
+/// Handles the measuring configure (already acked) of a relative-size sidebar: resolves
+/// the size, moves the surface to its edge, and commits so that the compositor sends
+/// the real configure, which is forwarded to the client. The client has not attached a
+/// buffer yet, so this commit is buffer-less.
+pub fn measured(
+    layer: &Rc<ZwlrLayerSurfaceV1>,
+    wl_surface: &WlSurface,
+    width: u32,
+    height: u32,
+    c: &Config,
+) {
+    let Size::Fraction(frac) = c.size else {
+        return;
+    };
+    let full = match c.edge {
+        Edge::Left | Edge::Right => width,
+        Edge::Top | Edge::Bottom => height,
+    };
+    let size = ((full as f64 * frac).round() as u32).max(1);
+    log::info!("output is {width}x{height}, sidebar size {size}");
+    let l = place(layer, c, size);
+    SIDEBARS.with_borrow(|v| {
+        if let Some(sb) = v.iter().find(|sb| std::ptr::eq(sb.layer.as_ptr(), &**layer)) {
+            sb.size.set(size);
+            sb.applied.set(Some(l));
+        }
+    });
+    wl_surface.send_commit();
+}
+
+/// Applies the current slide position to all layer surfaces of this thread. Layer-shell
+/// state is double-buffered, so we commit the surface ourselves; otherwise an idle
+/// client would never pick up the change.
+fn update_sidebars(c: &Config, s: Snapshot) {
+    SIDEBARS.with_borrow_mut(|v| {
+        v.retain(|sb| {
+            let (Some(layer), Some(wl_surface)) = (sb.layer.upgrade(), sb.wl_surface.upgrade())
+            else {
+                return false;
+            };
+            if layer.server_id().is_none() || wl_surface.server_id().is_none() {
+                return false;
+            }
+            let size = sb.size.get();
+            if size == 0 {
+                return true; // still measuring
+            }
+            let l = layout(c, size, s);
+            if sb.applied.get() != Some(l) {
+                send_layout(&layer, c, l);
+                wl_surface.send_commit();
+                sb.applied.set(Some(l));
+            }
+            true
+        })
+    });
+}
+
+// ---------------------------------------------------------------------------------------
+// Event loop
+// ---------------------------------------------------------------------------------------
+
+pub fn run(
+    name: &str,
+    config: Config,
+    program: &[String],
+    start_hidden: bool,
+    duration_ms: u64,
+) -> Result<(), SidebarError> {
+    // Held (locked) for the lifetime of the process.
+    let _pidfile = lock_pidfile(name)?;
+
+    // Block SIGUSR1 before any thread exists so that only the sigwait thread gets it.
+    // (std::process::Command resets the signal mask for the child.)
+    let mut sigs = uapi::empty_sig_set().map_err(|e| SidebarError::Signals(e.into()))?;
+    uapi::sigaddset(&mut sigs, c::SIGUSR1).map_err(|e| SidebarError::Signals(e.into()))?;
+    uapi::pthread_sigmask(c::SIG_BLOCK, Some(&sigs), None)
+        .map_err(|e| SidebarError::Signals(e.into()))?;
+
+    DURATION_MS.store(duration_ms, Relaxed);
+    *SLIDE.lock().unwrap() = Some(Slide {
+        visible: !start_hidden,
+        from: if start_hidden { 0.0 } else { 1.0 },
+        start: Instant::now(),
+    });
+
+    let acceptor = Acceptor::new(1000, false).map_err(SidebarError::CreateAcceptor)?;
+    Command::new(&program[0])
+        .args(&program[1..])
+        .with_wayland_display(acceptor.display())
+        .spawn_and_forward_exit_code()
+        .map_err(SidebarError::SpawnChild)?;
+
+    thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || loop {
+            match uapi::sigwait(&sigs) {
+                Ok(c::SIGUSR1) => toggle(),
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("sigwait failed: {}", Report::new(std::io::Error::from(e)));
+                    return;
+                }
+            }
+        })
+        .map_err(SidebarError::SpawnThread)?;
+
+    let config = Arc::new(config);
+    let mut id = 0;
+    loop {
+        let socket = acceptor
+            .accept()
+            .map_err(SidebarError::Accept)?
+            .expect("blocking acceptor returned None");
+        id += 1;
+        log::debug!("client {id} connected");
+        let config = config.clone();
+        thread::Builder::new()
+            .name(format!("client-{id}"))
+            .spawn(move || {
+                if let Err(e) = run_client(id, socket, &config) {
+                    log::error!("client {id}: {}", Report::new(e));
+                }
+                WAKERS.lock().unwrap().retain(|(i, _)| *i != id);
+                log::debug!("client {id} done");
+            })
+            .map_err(SidebarError::SpawnThread)?;
+    }
+}
+
+struct ClientHandlerImpl {
+    /// Destroys the state (and thereby ends the client loop) when the client goes away.
+    _destructor: Destructor,
+}
+
+impl ClientHandler for ClientHandlerImpl {}
+
+fn run_client(id: usize, socket: OwnedFd, config: &Arc<Config>) -> Result<(), SidebarError> {
+    let efd = uapi::eventfd(0, c::EFD_CLOEXEC | c::EFD_NONBLOCK)
+        .map_err(|e| SidebarError::Eventfd(e.into()))?;
+    let efd = Arc::new(efd);
+    WAKERS.lock().unwrap().push((id, efd.clone()));
+
+    let state = State::builder(proxy::BASELINE)
+        .with_log_prefix(&format!("client-{id}"))
+        .build()
+        .map_err(SidebarError::CreateState)?;
+    let client = state
+        .add_client(&Rc::new(socket))
+        .map_err(SidebarError::CreateState)?;
+    client.set_handler(ClientHandlerImpl {
+        _destructor: state.create_destructor(),
+    });
+    client
+        .display()
+        .set_handler(ClientWlDisplay::new(config.clone()));
+
+    while state.is_not_destroyed() {
+        let snap = snapshot();
+        update_sidebars(config, snap);
+        state.before_poll().map_err(SidebarError::Dispatch)?;
+        let mut fds = [
+            c::pollfd {
+                fd: state.poll_fd().as_raw_fd(),
+                events: c::POLLIN,
+                revents: 0,
+            },
+            c::pollfd {
+                fd: efd.raw(),
+                events: c::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout = if snap.animating { FRAME_MS } else { -1 };
+        if let Err(e) = uapi::poll(&mut fds, timeout)
+            && e.0 != c::EINTR
+        {
+            return Err(SidebarError::Poll(e.into()));
+        }
+        if fds[1].revents != 0 {
+            let _ = uapi::eventfd_read(efd.raw());
+        }
+        if let Err(e) = state.dispatch_available() {
+            // The state destroys itself on error, which ends the loop.
+            log::error!("could not dispatch: {}", Report::new(e));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// Pid file / --toggle
+//
+// The running instance holds an exclusive flock on its pid file. A pid file that can be
+// locked is stale, so there's no risk of signalling an unrelated process.
+// ---------------------------------------------------------------------------------------
+
+fn pidfile(name: &str) -> Result<PathBuf, SidebarError> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or(SidebarError::NoRuntimeDir)?;
+    Ok(PathBuf::from(dir).join(format!("wl-sidebar-{name}.pid")))
+}
+
+/// Non-blocking flock. `Ok(false)` if someone else holds a conflicting lock.
+fn try_lock(file: &File, op: c::c_int, path: &PathBuf) -> Result<bool, SidebarError> {
+    match uapi::flock(file.as_raw_fd(), op | c::LOCK_NB) {
+        Ok(()) => Ok(true),
+        Err(e) if e.0 == c::EWOULDBLOCK => Ok(false),
+        Err(e) => Err(SidebarError::Pidfile(path.clone(), e.into())),
+    }
+}
+
+/// Locks the pid file of sidebar `name` and writes our pid into it.
+fn lock_pidfile(name: &str) -> Result<File, SidebarError> {
+    let path = pidfile(name)?;
+    let err = |e| SidebarError::Pidfile(path.clone(), e);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(err)?;
+    if !try_lock(&file, c::LOCK_EX, &path)? {
+        return Err(SidebarError::AlreadyRunning(name.to_owned()));
+    }
+    file.set_len(0).map_err(err)?;
+    file.write_all(uapi::getpid().to_string().as_bytes())
+        .map_err(err)?;
+    Ok(file)
+}
+
+/// Sends SIGUSR1 to the running instance of sidebar `name`. Returns `false` if it isn't
+/// running.
+pub fn send_toggle(name: &str) -> Result<bool, SidebarError> {
+    let path = pidfile(name)?;
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(SidebarError::Pidfile(path, e)),
+    };
+    if try_lock(&file, c::LOCK_SH, &path)? {
+        return Ok(false); // stale
+    }
+    let pid: c::pid_t = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| SidebarError::BadPidfile(path.clone()))?;
+    uapi::kill(pid, c::SIGUSR1).map_err(|e| SidebarError::Kill(e.into()))?;
+    Ok(true)
+}
+
