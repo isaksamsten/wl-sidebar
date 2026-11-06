@@ -70,6 +70,24 @@ On other compositors, the sidebar keeps focus until it's hidden.
 
 Without `focus`, click the sidebar to type in it.
 
+## Single-instance apps
+
+The app must open its window from the process wl-sidebar starts, through the
+proxy's `WAYLAND_DISPLAY`. Some apps don't do that by default:
+
+- **Firefox**: if Firefox is already running, `firefox` just asks that instance to
+  open a window. Run a separate instance with its own profile:
+  `command = ["firefox", "--new-instance", "--profile", "/home/me/sidebar-firefox"]`
+  (the snap package can't use hidden directories in `$HOME`).
+- **Nautilus** (and other apps using libgxdp): on Wayland it asks the compositor
+  for a private connection over D-Bus (`org.gnome.Mutter.ServiceChannel`, which
+  niri also provides) and ignores `WAYLAND_DISPLAY`. Clear `XDG_SESSION_TYPE` to
+  stop that: `command = "XDG_SESSION_TYPE= exec nautilus --new-window"`. It also
+  must not already be running.
+- **GTK apps** generally: if the app is a single-instance GApplication that's already
+  running, the window opens in the existing instance. Ghostty, for example, needs
+  `--gtk-single-instance=false`.
+
 ## How hiding works
 
 Hiding animates a _negative margin_ on the anchored edge, so the app keeps its size and

@@ -706,7 +706,11 @@ impl ZwlrLayerSurfaceV1Handler for ProxyZwlrLayerSurfaceV1 {
         {
             return;
         }
+        // MAXIMIZED: layer-shell ignores xdg_surface.set_window_geometry, so anything the
+        // client draws outside its geometry (CSD shadows, resize margins) would be shown.
+        // GTK4 only drops that margin when maximized or fullscreen, not when tiled.
         let mut states = ArrayVec::<_, 9>::new();
+        states.push(XdgToplevelState::MAXIMIZED.0);
         if self.xdg_toplevel.version() >= XdgToplevel::ENM__STATE_TILED_TOP__SINCE {
             states.extend([
                 XdgToplevelState::TILED_LEFT.0,
