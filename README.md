@@ -30,11 +30,19 @@ focus = true
 
 ```sh
 cargo build --release
-wl-sidebar --toggle term   # start and show, or toggle if already running
+wl-sidebar --toggle term          # start and show, or toggle if already running
+wl-sidebar --start --hidden term  # start in the background (no-op if running)
+wl-sidebar --close term           # quit the program (SIGTERM, then SIGKILL after 3 s)
 ```
 
-The name is optional if only one sidebar is configured. Use `--config PATH` for
-another config file, or `wl-sidebar --run [--hidden] NAME` to run in the foreground.
+Sidebars run in the background, so `--close` is how to quit one whose program has no
+way to. It signals the program's whole process group, so helpers started by a
+wrapper script exit too. The name is optional if only one sidebar is configured.
+Use `--config PATH` for another config file.
+
+`wl-sidebar --run [--hidden] NAME` runs in the foreground instead, for debugging or
+for a service manager such as systemd. SIGINT (Ctrl-C), SIGTERM, and SIGHUP close it
+like `--close`.
 
 | Key                      | Default               | Description                                                                                                                                               |
 | ------------------------ | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |

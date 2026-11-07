@@ -1,4 +1,4 @@
-//! Control socket used by `--toggle` to talk to the running instance.
+//! Control socket used by `--toggle` and `--close` to talk to the running instance.
 //!
 //! The running instance holds an exclusive flock on `$XDG_RUNTIME_DIR/wl-sidebar-<name>.pid`
 //! (which contains its pid, for error messages) for its whole lifetime and listens on
@@ -176,8 +176,21 @@ fn connect(name: &str, path: &Path) -> Result<Option<UnixStream>, SidebarError> 
     }
 }
 
+/// Waits until the running instance of sidebar `name` (if any) has exited. Fails with
+/// [`SidebarError::StillRunning`] after `timeout`.
+pub fn wait_exit(name: &str, timeout: Duration) -> Result<(), SidebarError> {
+    let deadline = Instant::now() + timeout;
+    while running(name)? {
+        if Instant::now() >= deadline {
+            return Err(SidebarError::StillRunning(name.to_owned(), pid(name)));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 /// Whether some process holds the instance lock of sidebar `name`.
-fn running(name: &str) -> Result<bool, SidebarError> {
+pub fn running(name: &str) -> Result<bool, SidebarError> {
     let path = runtime_path(name, "pid")?;
     let file = match File::open(&path) {
         Ok(f) => f,

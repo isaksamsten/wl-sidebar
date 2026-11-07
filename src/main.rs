@@ -1,4 +1,5 @@
 mod anim;
+mod child;
 mod cli;
 mod config;
 mod fade;
@@ -25,6 +26,8 @@ enum SidebarError {
     SpawnChild(#[source] io::Error),
     #[error("could not spawn a thread")]
     SpawnThread(#[source] io::Error),
+    #[error("could not block signals")]
+    BlockSignals(#[source] io::Error),
     #[error("could not set up the control socket {}", .0.display())]
     Socket(PathBuf, #[source] io::Error),
     #[error("could not create an eventfd")]
@@ -61,6 +64,8 @@ enum SidebarError {
     Unresponsive(String, Option<i32>, #[source] io::Error),
     #[error("sidebar `{0}` rejected the command: {1}")]
     Remote(String, String),
+    #[error("sidebar `{}`{} did not exit after --close", .0, fmt_pid(.1))]
+    StillRunning(String, Option<i32>),
     #[error("could not start the sidebar")]
     SpawnDaemon(#[source] io::Error),
     #[error("could not open log file {}", .0.display())]

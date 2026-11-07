@@ -9,7 +9,7 @@ use {
     crate::{
         SidebarError,
         anim::Animations,
-        fade, ipc,
+        child, fade, ipc,
         proxy::{self, ClientWlDisplay},
         remap::{Phase, Remap},
     },
@@ -583,6 +583,8 @@ pub fn run(
     start_hidden: bool,
     anim: Animations,
 ) -> Result<(), SidebarError> {
+    // Before spawning any thread: they all inherit the mask.
+    child::block_signals().map_err(SidebarError::BlockSignals)?;
     REFOCUS_ENABLED.store(config.focus == Focus::Remap, Relaxed);
     HIDE_ON_UNFOCUS.store(config.hide_on_unfocus, Relaxed);
     *SLIDE.lock().unwrap() = Some(Slide {
@@ -594,18 +596,20 @@ pub fn run(
     });
 
     // Becomes the running instance (fails if there already is one) and starts serving
-    // `--toggle`. The lock is held for the lifetime of the process.
+    // `--toggle` and `--close`. The lock is held for the lifetime of the process.
     let _instance = ipc::listen(name, |cmd| match cmd {
         "toggle" => Ok(toggle().to_owned()),
+        "close" => child::close(c::SIGTERM).map(str::to_owned),
         _ => Err(format!("unknown command `{cmd}`")),
     })?;
 
     let acceptor = Acceptor::new(1000, false).map_err(SidebarError::CreateAcceptor)?;
-    Command::new(&program[0])
-        .args(&program[1..])
-        .with_wayland_display(acceptor.display())
-        .spawn_and_forward_exit_code()
-        .map_err(SidebarError::SpawnChild)?;
+    child::spawn(
+        Command::new(&program[0])
+            .args(&program[1..])
+            .with_wayland_display(acceptor.display()),
+    )
+    .map_err(SidebarError::SpawnChild)?;
 
     let config = Arc::new(config);
     let mut id = 0;
