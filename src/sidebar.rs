@@ -9,17 +9,14 @@ use {
     crate::{
         SidebarError,
         anim::Animations,
-        fade,
+        fade, ipc,
         proxy::{self, ClientWlDisplay},
         remap::{Phase, Remap},
     },
     error_reporter::Report,
     std::{
         cell::{Cell, RefCell},
-        fs::{self, File, OpenOptions},
-        io::{ErrorKind, Write},
         os::fd::{AsRawFd, OwnedFd},
-        path::PathBuf,
         process::Command,
         rc::{Rc, Weak},
         sync::{
@@ -260,8 +257,9 @@ fn snapshot() -> Snapshot {
 }
 
 /// Shows or hides the sidebar. With `focus = "remap"`, a shown (fully slid in) sidebar
-/// without keyboard focus gets focused instead of hidden.
-pub fn toggle() {
+/// without keyboard focus gets focused instead of hidden. Returns the resulting state.
+pub fn toggle() -> &'static str {
+    let state;
     {
         let mut guard = SLIDE.lock().unwrap();
         let s = guard.as_mut().expect("slide state not initialized");
@@ -269,13 +267,15 @@ pub fn toggle() {
         let (_, _, animating) = s.position(now);
         if REFOCUS_ENABLED.load(Relaxed) && s.visible && !animating && FOCUSED.load(Relaxed) == 0 {
             REFOCUS.fetch_add(1, Relaxed);
-            log::info!("focusing");
+            state = "focused";
         } else {
             s.retarget(!s.visible, now);
-            log::info!("{}", if s.visible { "showing" } else { "hiding" });
+            state = if s.visible { "shown" } else { "hidden" };
         }
+        log::info!("toggle: {state}");
     }
     wake_all();
+    state
 }
 
 /// Hides the sidebar after it lost keyboard focus (`hide_on_unfocus`).
@@ -583,16 +583,6 @@ pub fn run(
     start_hidden: bool,
     anim: Animations,
 ) -> Result<(), SidebarError> {
-    // Held (locked) for the lifetime of the process.
-    let _pidfile = lock_pidfile(name)?;
-
-    // Block SIGUSR1 before any thread exists so that only the sigwait thread gets it.
-    // (std::process::Command resets the signal mask for the child.)
-    let mut sigs = uapi::empty_sig_set().map_err(|e| SidebarError::Signals(e.into()))?;
-    uapi::sigaddset(&mut sigs, c::SIGUSR1).map_err(|e| SidebarError::Signals(e.into()))?;
-    uapi::pthread_sigmask(c::SIG_BLOCK, Some(&sigs), None)
-        .map_err(|e| SidebarError::Signals(e.into()))?;
-
     REFOCUS_ENABLED.store(config.focus == Focus::Remap, Relaxed);
     HIDE_ON_UNFOCUS.store(config.hide_on_unfocus, Relaxed);
     *SLIDE.lock().unwrap() = Some(Slide {
@@ -603,28 +593,19 @@ pub fn run(
         anim,
     });
 
+    // Becomes the running instance (fails if there already is one) and starts serving
+    // `--toggle`. The lock is held for the lifetime of the process.
+    let _instance = ipc::listen(name, |cmd| match cmd {
+        "toggle" => Ok(toggle().to_owned()),
+        _ => Err(format!("unknown command `{cmd}`")),
+    })?;
+
     let acceptor = Acceptor::new(1000, false).map_err(SidebarError::CreateAcceptor)?;
     Command::new(&program[0])
         .args(&program[1..])
         .with_wayland_display(acceptor.display())
         .spawn_and_forward_exit_code()
         .map_err(SidebarError::SpawnChild)?;
-
-    thread::Builder::new()
-        .name("signals".into())
-        .spawn(move || {
-            loop {
-                match uapi::sigwait(&sigs) {
-                    Ok(c::SIGUSR1) => toggle(),
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::error!("sigwait failed: {}", Report::new(std::io::Error::from(e)));
-                        return;
-                    }
-                }
-            }
-        })
-        .map_err(SidebarError::SpawnThread)?;
 
     let config = Arc::new(config);
     let mut id = 0;
@@ -722,65 +703,4 @@ fn run_client(id: usize, socket: OwnedFd, config: &Arc<Config>) -> Result<(), Si
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------------------
-// Pid file / --toggle
-//
-// The running instance holds an exclusive flock on its pid file. A pid file that can be
-// locked is stale, so there's no risk of signalling an unrelated process.
-// ---------------------------------------------------------------------------------------
-
-fn pidfile(name: &str) -> Result<PathBuf, SidebarError> {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or(SidebarError::NoRuntimeDir)?;
-    Ok(PathBuf::from(dir).join(format!("wl-sidebar-{name}.pid")))
-}
-
-/// Non-blocking flock. `Ok(false)` if someone else holds a conflicting lock.
-fn try_lock(file: &File, op: c::c_int, path: &PathBuf) -> Result<bool, SidebarError> {
-    match uapi::flock(file.as_raw_fd(), op | c::LOCK_NB) {
-        Ok(()) => Ok(true),
-        Err(e) if e.0 == c::EWOULDBLOCK => Ok(false),
-        Err(e) => Err(SidebarError::Pidfile(path.clone(), e.into())),
-    }
-}
-
-/// Locks the pid file of sidebar `name` and writes our pid into it.
-fn lock_pidfile(name: &str) -> Result<File, SidebarError> {
-    let path = pidfile(name)?;
-    let err = |e| SidebarError::Pidfile(path.clone(), e);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(err)?;
-    if !try_lock(&file, c::LOCK_EX, &path)? {
-        return Err(SidebarError::AlreadyRunning(name.to_owned()));
-    }
-    file.set_len(0).map_err(err)?;
-    file.write_all(uapi::getpid().to_string().as_bytes())
-        .map_err(err)?;
-    Ok(file)
-}
-
-/// Sends SIGUSR1 to the running instance of sidebar `name`. Returns `false` if it isn't
-/// running.
-pub fn send_toggle(name: &str) -> Result<bool, SidebarError> {
-    let path = pidfile(name)?;
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(SidebarError::Pidfile(path, e)),
-    };
-    if try_lock(&file, c::LOCK_SH, &path)? {
-        return Ok(false); // stale
-    }
-    let pid: c::pid_t = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .ok_or_else(|| SidebarError::BadPidfile(path.clone()))?;
-    uapi::kill(pid, c::SIGUSR1).map_err(|e| SidebarError::Kill(e.into()))?;
-    Ok(true)
 }

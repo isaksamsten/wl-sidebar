@@ -2,6 +2,7 @@ mod anim;
 mod cli;
 mod config;
 mod fade;
+mod ipc;
 mod proxy;
 mod remap;
 mod sidebar;
@@ -24,8 +25,8 @@ enum SidebarError {
     SpawnChild(#[source] io::Error),
     #[error("could not spawn a thread")]
     SpawnThread(#[source] io::Error),
-    #[error("could not set up signal handling")]
-    Signals(#[source] io::Error),
+    #[error("could not set up the control socket {}", .0.display())]
+    Socket(PathBuf, #[source] io::Error),
     #[error("could not create an eventfd")]
     Eventfd(#[source] io::Error),
     #[error("could not create the proxy state")]
@@ -56,12 +57,18 @@ enum SidebarError {
     AlreadyRunning(String),
     #[error("could not access pid file {}", .0.display())]
     Pidfile(PathBuf, #[source] io::Error),
-    #[error("could not read the pid of the running instance from {}", .0.display())]
-    BadPidfile(PathBuf),
+    #[error("sidebar `{}` is running{} but not responding; kill it to restart", .0, fmt_pid(.1))]
+    Unresponsive(String, Option<i32>, #[source] io::Error),
+    #[error("sidebar `{0}` rejected the command: {1}")]
+    Remote(String, String),
     #[error("could not start the sidebar")]
     SpawnDaemon(#[source] io::Error),
-    #[error("could not signal the running instance")]
-    Kill(#[source] io::Error),
+    #[error("could not open log file {}", .0.display())]
+    LogFile(PathBuf, #[source] io::Error),
+}
+
+fn fmt_pid(pid: &Option<i32>) -> String {
+    pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
 }
 
 fn main() -> Result<(), Report<SidebarError>> {
@@ -69,5 +76,13 @@ fn main() -> Result<(), Report<SidebarError>> {
         .filter_level(LevelFilter::Info)
         .parse_default_env()
         .init();
+    // A panic on any thread takes down the whole process. Otherwise a panicking thread
+    // (e.g. the control thread) could die alone and leave a stuck instance holding the
+    // lock; dead instances are simply restarted by the next `--toggle`.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::abort();
+    }));
     cli::main().map_err(Report::new)
 }

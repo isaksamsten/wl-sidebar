@@ -1,7 +1,10 @@
 use {
-    crate::{SidebarError, config, sidebar},
+    crate::{SidebarError, config, ipc, sidebar},
     clap::{ArgGroup, Parser, ValueHint},
+    error_reporter::Report,
     std::{
+        fs::{self, File},
+        io::ErrorKind,
         os::unix::process::CommandExt,
         path::PathBuf,
         process::{Command, Stdio},
@@ -42,7 +45,8 @@ pub fn main() -> Result<(), SidebarError> {
     if args.run {
         return sidebar::run(&sb.name, sb.config, &sb.command, args.hidden, sb.animations);
     }
-    if sidebar::send_toggle(&sb.name)? {
+    if let Some(state) = ipc::send(&sb.name, "toggle")? {
+        log::debug!("sidebar {}: {state}", sb.name);
         return Ok(());
     }
     log::info!("starting sidebar {}", sb.name);
@@ -54,6 +58,14 @@ pub fn main() -> Result<(), SidebarError> {
         .arg("--")
         .arg(&sb.name)
         .stdin(Stdio::null());
+    // The daemon outlives us and our stderr, so keep its output (including panics).
+    match open_log(&sb.name) {
+        Ok((path, out, err)) => {
+            log::info!("logging to {}", path.display());
+            cmd.stdout(out).stderr(err);
+        }
+        Err(e) => log::warn!("{}", Report::new(e)),
+    }
     // Detach from our session so that closing the terminal doesn't kill the sidebar.
     // SAFETY: setsid is async-signal-safe.
     unsafe {
@@ -61,4 +73,28 @@ pub fn main() -> Result<(), SidebarError> {
     }
     cmd.spawn().map_err(SidebarError::SpawnDaemon)?;
     Ok(())
+}
+
+/// Opens `$XDG_STATE_HOME/wl-sidebar/<name>.log` for a new daemon, keeping the previous
+/// log (which may explain why the previous instance died) as `<name>.log.old`.
+fn open_log(name: &str) -> Result<(PathBuf, File, File), SidebarError> {
+    let dir = match std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(".local/state"),
+            None => PathBuf::from("."),
+        },
+    }
+    .join("wl-sidebar");
+    let path = dir.join(format!("{name}.log"));
+    let err = |e| SidebarError::LogFile(path.clone(), e);
+    fs::create_dir_all(&dir).map_err(err)?;
+    match fs::rename(&path, dir.join(format!("{name}.log.old"))) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(err(e)),
+    }
+    let out = File::create(&path).map_err(err)?;
+    let err = out.try_clone().map_err(err)?;
+    Ok((path, out, err))
 }
