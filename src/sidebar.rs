@@ -179,6 +179,10 @@ static WAKERS: Mutex<Vec<(usize, Arc<uapi::OwnedFd>)>> = Mutex::new(Vec::new());
 static REFOCUS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Bumped to ask all client threads to remap their (shown) sidebars to take focus.
 static REFOCUS: AtomicU64 = AtomicU64::new(0);
+/// A refocus was requested and the sidebar hasn't gained keyboard focus since. The next
+/// toggle then hides instead of trying again, so toggling can never get stuck on
+/// "focused" when the compositor doesn't hand out focus (or the remap can't happen).
+static REFOCUS_PENDING: AtomicBool = AtomicBool::new(false);
 /// Number of client keyboards whose focus is on one of the client's surfaces.
 static FOCUSED: AtomicUsize = AtomicUsize::new(0);
 /// `hide_on_unfocus`: hide the sidebar when [`FOCUSED`] drops to 0.
@@ -204,6 +208,7 @@ impl KeyboardFocus {
         self.0 = focused;
         if focused {
             FOCUSED.fetch_add(1, Relaxed);
+            REFOCUS_PENDING.store(false, Relaxed);
         } else if FOCUSED.fetch_sub(1, Relaxed) == 1 && HIDE_ON_UNFOCUS.load(Relaxed) {
             UNFOCUS_DEADLINE.set(Some(Instant::now() + UNFOCUS_GRACE));
         }
@@ -265,10 +270,17 @@ pub fn toggle() -> &'static str {
         let s = guard.as_mut().expect("slide state not initialized");
         let now = Instant::now();
         let (_, _, animating) = s.position(now);
-        if REFOCUS_ENABLED.load(Relaxed) && s.visible && !animating && FOCUSED.load(Relaxed) == 0 {
+        if REFOCUS_ENABLED.load(Relaxed)
+            && s.visible
+            && !animating
+            && FOCUSED.load(Relaxed) == 0
+            && !REFOCUS_PENDING.load(Relaxed)
+        {
+            REFOCUS_PENDING.store(true, Relaxed);
             REFOCUS.fetch_add(1, Relaxed);
             state = "focused";
         } else {
+            REFOCUS_PENDING.store(false, Relaxed);
             s.retarget(!s.visible, now);
             state = if s.visible { "shown" } else { "hidden" };
         }
@@ -518,8 +530,12 @@ fn update_sidebars(c: &Config, s: Snapshot) {
             }
             if let Some(remap) = &sb.remap {
                 // Take focus while shown: unmap, and map again right below.
-                if refocus && s.visible && remap.unmap(&wl_surface) {
-                    sb.applied.set(None);
+                if refocus && s.visible {
+                    if remap.unmap(&wl_surface) {
+                        sb.applied.set(None);
+                    } else {
+                        log::warn!("cannot refocus: surface is {:?}", remap.phase());
+                    }
                 }
                 match remap.phase() {
                     Phase::Unmapped => {
