@@ -55,8 +55,8 @@ like `--close`.
 | `slide`                  | `true`                | Slide in/out; `false` keeps the sidebar in place during fades                                                                                             |
 | `fade`                   | `false`               | Fade in/out; requires `wp_alpha_modifier_v1`                                                                                                              |
 | `layer`                  | `"top"`               | `background\|bottom\|top\|overlay`                                                                                                                        |
-| `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown; always `none` while hidden                                                                                      |
-| `focus`                  | `false`               | Take keyboard focus on show; see [Focus](#focus)                                                                                                          |
+| `keyboard-interactivity` | `"on-demand"`         | `none\|exclusive\|on-demand` while shown; always `none` while hidden. See [Focus](#focus)                                                                 |
+| `focus`                  | `false`               | Take keyboard focus on show (requires `on-demand`); see [Focus](#focus)                                                                                   |
 | `hide-on-unfocus`        | `false`               | Hide on keyboard focus loss; see [Focus](#focus)                                                                                                          |
 | `namespace`              | `"wl-sidebar-<name>"` | Layer-shell namespace                                                                                                                                     |
 
@@ -100,16 +100,25 @@ itself while fading is enabled.
 
 ## Focus
 
-With `focus = true`, the sidebar takes keyboard focus when shown and returns it
-to the previous window when hidden. Without it, click the sidebar to type.
+`keyboard-interactivity` sets how the sidebar gets keyboard focus while shown:
 
-On niri, clicking another window moves focus away. The next toggle refocuses the
-sidebar; another hides it. On other compositors, it keeps focus until hidden.
+- `"on-demand"` (default): click the sidebar to type. Clicking another window
+  moves focus away again.
+- `"exclusive"`: the sidebar takes focus when shown and keeps it until hidden.
+  Only an exclusive surface on a higher layer, such as a launcher, can take it.
+- `"none"`: the sidebar never gets keyboard focus.
+
+When hidden, focus returns to the previous window.
+
+`focus = true` (with `"on-demand"`) also takes focus when shown. Clicking another
+window still moves focus away. The next toggle then refocuses the sidebar, and
+another hides it. If the sidebar doesn't get focus on your compositor, use
+`"exclusive"` instead. With `focus = true`, the app cannot use explicit sync
+(`linux-drm-syncobj`).
 
 `hide-on-unfocus = true` hides the sidebar when it loses keyboard focus. It must
-have received focus first: use `focus = true` or click it after showing. Where
-the sidebar keeps focus until hidden, an exclusive launcher on a higher layer
-can still take focus.
+have received focus first: use `focus = true`, `"exclusive"`, or click it after
+showing.
 
 ## Single-instance apps
 

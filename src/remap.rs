@@ -1,9 +1,10 @@
-//! `focus = "remap"`: unmap the sidebar once it's fully hidden and map it again on show.
+//! `focus = true`: unmap the sidebar once it's fully hidden and map it again on show.
 //!
-//! niri (and possibly others) gives keyboard focus to an `on-demand` layer surface when it
-//! gets mapped, but not when its interactivity changes. Remapping on every show therefore
-//! grabs focus once, after which the sidebar behaves like any `on-demand` surface (click
-//! elsewhere to unfocus, click it to focus again).
+//! Layer-shell has no request to focus an `on-demand` surface. Compositors such as niri
+//! and Umbriel give keyboard focus to an `on-demand` layer surface when it gets mapped,
+//! though. Briefly switching to `exclusive` and back doesn't work on niri, but remapping
+//! on every show does: it grabs focus once, after which the sidebar behaves like any
+//! `on-demand` surface (click elsewhere to unfocus, click it to focus again).
 //!
 //! The client doesn't know about any of this:
 //!

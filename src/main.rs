@@ -56,6 +56,8 @@ enum SidebarError {
     EmptyCommand(String),
     #[error("sidebar `{0}`: invalid animation: {1}")]
     InvalidAnimation(String, String),
+    #[error("sidebar `{0}`: `focus = true` requires `keyboard-interactivity = \"on-demand\"`")]
+    FocusNeedsOnDemand(String),
     #[error("sidebar `{0}` is already running")]
     AlreadyRunning(String),
     #[error("could not access pid file {}", .0.display())]

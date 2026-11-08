@@ -52,6 +52,12 @@ const FRAME_MS: c::c_int = 8;
 /// hides. Focus moving between the client's own surfaces (e.g. to a popup) arrives as a
 /// leave followed by an enter; this keeps that from hiding the sidebar.
 const UNFOCUS_GRACE: Duration = Duration::from_millis(100);
+/// `focus`: how long to wait for keyboard focus with `EXCLUSIVE` interactivity before
+/// falling back to remapping.
+const GRAB_TIMEOUT: Duration = Duration::from_millis(300);
+/// `focus`: how long focus must survive the switch back to `ON_DEMAND`. Some compositors
+/// (niri) drop focus when interactivity changes from `EXCLUSIVE` to `ON_DEMAND`.
+const SETTLE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Edge {
@@ -126,27 +132,17 @@ impl std::str::FromStr for Size {
     }
 }
 
-/// How to take keyboard focus on show.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum Focus {
-    /// Don't; use `keyboard_interactivity`.
-    Off,
-    /// `EXCLUSIVE` interactivity while shown.
-    Exclusive,
-    /// `ON_DEMAND` interactivity, unmapped while hidden and mapped again on show (see
-    /// `remap`).
-    Remap,
-}
-
 pub struct Config {
     pub edge: Edge,
     pub size: Size,
     /// Whether to reserve space (exclusive zone) while shown.
     pub reserve: bool,
     pub layer: ZwlrLayerShellV1Layer,
-    /// Interactivity while shown (when `focus` is `Off`). Always `NONE` while hidden.
+    /// Interactivity while shown. Always `NONE` while hidden.
     pub keyboard_interactivity: ZwlrLayerSurfaceV1KeyboardInteractivity,
-    pub focus: Focus,
+    /// Take keyboard focus on show by unmapping the surface while hidden and mapping it
+    /// again on show (see `remap`). Requires `ON_DEMAND` interactivity.
+    pub focus: bool,
     pub namespace: String,
     /// Connector name of the output to pin the sidebar to.
     pub output: Option<String>,
@@ -175,7 +171,7 @@ struct Slide {
 static SLIDE: Mutex<Option<Slide>> = Mutex::new(None);
 /// Eventfds of all client threads, keyed by client id.
 static WAKERS: Mutex<Vec<(usize, Arc<uapi::OwnedFd>)>> = Mutex::new(Vec::new());
-/// `focus = "remap"`: toggling a shown but unfocused sidebar focuses it instead of hiding.
+/// `focus`: toggling a shown but unfocused sidebar focuses it instead of hiding.
 static REFOCUS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Bumped to ask all client threads to remap their (shown) sidebars to take focus.
 static REFOCUS: AtomicU64 = AtomicU64::new(0);
@@ -187,6 +183,9 @@ static REFOCUS_PENDING: AtomicBool = AtomicBool::new(false);
 static FOCUSED: AtomicUsize = AtomicUsize::new(0);
 /// `hide_on_unfocus`: hide the sidebar when [`FOCUSED`] drops to 0.
 static HIDE_ON_UNFOCUS: AtomicBool = AtomicBool::new(false);
+/// `focus`: grabbing focus with `EXCLUSIVE` didn't work on this compositor; take focus
+/// by remapping instead (see `remap`).
+static REMAP_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Set when this thread saw [`FOCUSED`] drop to 0 with `hide_on_unfocus`. If focus
@@ -261,7 +260,7 @@ fn snapshot() -> Snapshot {
     }
 }
 
-/// Shows or hides the sidebar. With `focus = "remap"`, a shown (fully slid in) sidebar
+/// Shows or hides the sidebar. With `focus`, a shown (fully slid in) sidebar
 /// without keyboard focus gets focused instead of hidden. Returns the resulting state.
 pub fn toggle() -> &'static str {
     let state;
@@ -346,14 +345,10 @@ fn layout(c: &Config, size: u32, s: Snapshot) -> Layout {
     // Focus changes immediately on toggle, not at the end of the animation. While
     // hidden, `NONE` also drops any on-demand focus the sidebar had from a click, so
     // keystrokes don't go to an invisible terminal.
-    let keyboard_interactivity = if !s.visible {
-        ZwlrLayerSurfaceV1KeyboardInteractivity::NONE
+    let keyboard_interactivity = if s.visible {
+        c.keyboard_interactivity
     } else {
-        match c.focus {
-            Focus::Off => c.keyboard_interactivity,
-            Focus::Exclusive => ZwlrLayerSurfaceV1KeyboardInteractivity::EXCLUSIVE,
-            Focus::Remap => ZwlrLayerSurfaceV1KeyboardInteractivity::ON_DEMAND,
-        }
+        ZwlrLayerSurfaceV1KeyboardInteractivity::NONE
     };
     Layout {
         margin,
@@ -377,8 +372,33 @@ struct Sidebar {
     /// Effective size last sent with set_size.
     placed: Cell<u32>,
     applied: Cell<Option<Layout>>,
-    /// Set with `Focus::Remap`.
+    /// Set with `focus`.
     remap: Option<Rc<Remap>>,
+    /// `focus`: progress of taking focus with `EXCLUSIVE` interactivity.
+    grab: Cell<Grab>,
+    /// `focus`: visibility at the last update, to detect when the sidebar is shown.
+    shown: Cell<bool>,
+}
+
+/// `focus`: taking keyboard focus by briefly setting `EXCLUSIVE` interactivity. If that
+/// fails, [`REMAP_FALLBACK`] is set and focus is taken by remapping from then on.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Grab {
+    Idle,
+    /// `EXCLUSIVE` interactivity until the sidebar gets focus, or the deadline passes.
+    Exclusive(Instant),
+    /// Got focus and switched back to `ON_DEMAND`. If focus is still there at the
+    /// deadline, it worked.
+    Settling(Instant),
+}
+
+impl Grab {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Grab::Idle => None,
+            Grab::Exclusive(d) | Grab::Settling(d) => Some(d),
+        }
+    }
 }
 
 impl Sidebar {
@@ -442,6 +462,8 @@ pub fn register(
             placed: Cell::new(size),
             applied: Cell::new(applied),
             remap,
+            grab: Cell::new(Grab::Idle),
+            shown: Cell::new(false),
         })
     });
     size == 0
@@ -511,10 +533,13 @@ thread_local! {
 
 /// Applies the current slide position to all layer surfaces of this thread. Layer-shell
 /// state is double-buffered, so we commit the surface ourselves; otherwise an idle
-/// client would never pick up the change.
-fn update_sidebars(c: &Config, s: Snapshot) {
+/// client would never pick up the change. Returns when to run again for a pending
+/// focus grab.
+fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
     let current = REFOCUS.load(Relaxed);
     let refocus = SEEN_REFOCUS.with(|seen| seen.replace(current)) != current;
+    let now = Instant::now();
+    let mut wake: Option<Instant> = None;
     SIDEBARS.with_borrow_mut(|v| {
         v.retain(|sb| {
             let (Some(layer), Some(wl_surface)) = (sb.layer.upgrade(), sb.wl_surface.upgrade())
@@ -529,8 +554,49 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                 return true; // still measuring
             }
             if let Some(remap) = &sb.remap {
+                let was_shown = sb.shown.replace(s.visible);
+                // With remapping, showing maps the (unmapped while hidden) surface, which
+                // takes focus by itself; only a refocus needs an extra unmap.
+                let mut remap_now = false;
+                if !s.visible {
+                    sb.grab.set(Grab::Idle);
+                } else if REMAP_FALLBACK.load(Relaxed) {
+                    remap_now = refocus;
+                } else {
+                    if refocus || !was_shown {
+                        log::debug!("focus: trying exclusive interactivity");
+                        sb.grab.set(Grab::Exclusive(now + GRAB_TIMEOUT));
+                    }
+                    let focused = FOCUSED.load(Relaxed) > 0;
+                    let failed = match sb.grab.get() {
+                        Grab::Exclusive(_) if focused => {
+                            sb.grab.set(Grab::Settling(now + SETTLE));
+                            false
+                        }
+                        Grab::Settling(d) if now >= d && focused => {
+                            log::debug!("focus: exclusive interactivity works");
+                            sb.grab.set(Grab::Idle);
+                            false
+                        }
+                        Grab::Exclusive(d) | Grab::Settling(d) => now >= d,
+                        Grab::Idle => false,
+                    };
+                    if failed {
+                        log::info!(
+                            "focus: exclusive -> on-demand did not keep focus, \
+                             falling back to remapping"
+                        );
+                        REMAP_FALLBACK.store(true, Relaxed);
+                        sb.grab.set(Grab::Idle);
+                        remap_now = true;
+                    }
+                    wake = match (wake, sb.grab.get().deadline()) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
                 // Take focus while shown: unmap, and map again right below.
-                if refocus && s.visible {
+                if remap_now {
                     if remap.unmap(&wl_surface) {
                         sb.applied.set(None);
                     } else {
@@ -555,7 +621,12 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                         // reset (invalid) state.
                         return true;
                     }
-                    Phase::Mapped if !s.visible && !s.animating && remap.unmap(&wl_surface) => {
+                    Phase::Mapped
+                        if REMAP_FALLBACK.load(Relaxed)
+                            && !s.visible
+                            && !s.animating
+                            && remap.unmap(&wl_surface) =>
+                    {
                         sb.applied.set(None);
                         return true;
                     }
@@ -569,7 +640,10 @@ fn update_sidebars(c: &Config, s: Snapshot) {
                 wl_surface.send_commit();
                 return true;
             }
-            let l = layout(c, size, s);
+            let mut l = layout(c, size, s);
+            if matches!(sb.grab.get(), Grab::Exclusive(_)) {
+                l.keyboard_interactivity = ZwlrLayerSurfaceV1KeyboardInteractivity::EXCLUSIVE;
+            }
             if sb.applied.get() != Some(l) {
                 send_layout(&layer, c, l);
                 sb.applied.set(Some(l));
@@ -580,6 +654,13 @@ fn update_sidebars(c: &Config, s: Snapshot) {
             true
         })
     });
+    wake
+}
+
+/// Whether a sidebar of this thread is taking focus with `EXCLUSIVE` interactivity.
+/// Focus may briefly come and go meanwhile, which must not trigger `hide_on_unfocus`.
+fn grabbing() -> bool {
+    SIDEBARS.with_borrow(|v| v.iter().any(|sb| sb.grab.get() != Grab::Idle))
 }
 
 /// Sets the alpha multiplier of the sidebar surface tree for the current position.
@@ -601,7 +682,7 @@ pub fn run(
 ) -> Result<(), SidebarError> {
     // Before spawning any thread: they all inherit the mask.
     child::block_signals().map_err(SidebarError::BlockSignals)?;
-    REFOCUS_ENABLED.store(config.focus == Focus::Remap, Relaxed);
+    REFOCUS_ENABLED.store(config.focus, Relaxed);
     HIDE_ON_UNFOCUS.store(config.hide_on_unfocus, Relaxed);
     *SLIDE.lock().unwrap() = Some(Slide {
         visible: !start_hidden,
@@ -682,12 +763,13 @@ fn run_client(id: usize, socket: OwnedFd, config: &Arc<Config>) -> Result<(), Si
             && Instant::now() >= deadline
         {
             UNFOCUS_DEADLINE.set(None);
-            if FOCUSED.load(Relaxed) == 0 {
+            // Focus may briefly go away while taking it; see `Grab`.
+            if FOCUSED.load(Relaxed) == 0 && !grabbing() {
                 hide_unfocused();
             }
         }
         let snap = snapshot();
-        update_sidebars(config, snap);
+        let wake = update_sidebars(config, snap);
         state.before_poll().map_err(SidebarError::Dispatch)?;
         let mut fds = [
             c::pollfd {
@@ -702,7 +784,7 @@ fn run_client(id: usize, socket: OwnedFd, config: &Arc<Config>) -> Result<(), Si
             },
         ];
         let mut timeout = if snap.animating { FRAME_MS } else { -1 };
-        if let Some(deadline) = UNFOCUS_DEADLINE.get() {
+        for deadline in [UNFOCUS_DEADLINE.get(), wake].into_iter().flatten() {
             let ms = deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis()

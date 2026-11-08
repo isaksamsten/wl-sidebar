@@ -8,7 +8,7 @@ use {
     crate::{
         fade::{self, FadeSurface},
         remap::Remap,
-        sidebar::{self, Config, Focus, KeyboardFocus},
+        sidebar::{self, Config, KeyboardFocus},
     },
     arrayvec::ArrayVec,
     std::{cell::OnceCell, mem, rc::Rc, sync::Arc},
@@ -204,18 +204,18 @@ struct ClientOrgKdeKwinServerDecorationManager;
 
 struct ClientOrgKdeKwinServerDecoration;
 
-/// Handler for client-created wl_compositor objects (with `--output`, `focus = "remap"`
-/// or `fade`).
+/// Handler for client-created wl_compositor objects (with `--output`, `focus` or
+/// `fade`).
 struct ClientWlCompositor {
     fade: bool,
 }
 
-/// Handler for client-created wl_surface objects (with `--output`, `focus = "remap"` or
+/// Handler for client-created wl_surface objects (with `--output`, `focus` or
 /// `fade`). Drops enter/leave events for the proxy's own wl_output, which the client
 /// doesn't know.
 #[derive(Default)]
 struct ClientWlSurface {
-    /// Set on the sidebar's surface with `focus = "remap"`.
+    /// Set on the sidebar's surface with `focus`.
     remap: Option<Rc<Remap>>,
     /// Set on every surface with `fade`.
     fade: Option<Rc<FadeSurface>>,
@@ -229,11 +229,12 @@ struct ClientWlSubsurface {
     fade: Option<Rc<FadeSurface>>,
 }
 
-/// Handler for client-created wl_seat objects (only with `focus = "remap"`).
+/// Handler for client-created wl_seat objects (only with `focus` or `hide_on_unfocus`).
 struct ClientWlSeat;
 
-/// Handler for client-created wl_keyboard objects (only with `focus = "remap"`). Tracks
-/// whether the sidebar has keyboard focus, for `--toggle`.
+/// Handler for client-created wl_keyboard objects (only with `focus` or
+/// `hide_on_unfocus`). Tracks whether the sidebar has keyboard focus, for `--toggle` and
+/// `hide_on_unfocus`.
 #[derive(Default)]
 struct ClientWlKeyboard {
     focus: KeyboardFocus,
@@ -542,7 +543,7 @@ impl WlRegistryHandler for ClientWlRegistry {
             }
             WlCompositor::INTERFACE
                 if self.config.output.is_some()
-                    || self.config.focus == Focus::Remap
+                    || self.config.focus
                     || self.config.fade =>
             {
                 let id = id.downcast::<WlCompositor>();
@@ -554,7 +555,7 @@ impl WlRegistryHandler for ClientWlRegistry {
                 let id = id.downcast::<WlSubcompositor>();
                 id.set_handler(ClientWlSubcompositor);
             }
-            WlSeat::INTERFACE if self.config.focus == Focus::Remap => {
+            WlSeat::INTERFACE if self.config.focus || self.config.hide_on_unfocus => {
                 let id = id.downcast::<WlSeat>();
                 id.set_handler(ClientWlSeat);
             }
@@ -591,7 +592,7 @@ impl WlRegistryHandler for ClientWlRegistry {
             }
             // With explicit sync, attaching a buffer requires fresh acquire/release
             // points, so remap could not re-attach the client's buffer.
-            ObjectInterface::WpLinuxDrmSyncobjManagerV1 if self.config.focus == Focus::Remap => {
+            ObjectInterface::WpLinuxDrmSyncobjManagerV1 if self.config.focus => {
                 self.filter.ignore_global(name);
             }
             // We set the alpha multiplier ourselves, and a surface can only have one.
@@ -662,7 +663,7 @@ impl XdgSurfaceHandler for ClientXdgSurface {
         );
         // Sets size, anchor, margin, exclusive zone and keyboard interactivity. The
         // client's initial commit applies them.
-        let remap = (c.focus == Focus::Remap).then(Remap::new);
+        let remap = c.focus.then(Remap::new);
         if let Some(remap) = &remap
             && let Ok(mut h) = self.wl_surface.try_get_handler_mut::<ClientWlSurface>()
         {

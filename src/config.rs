@@ -11,7 +11,7 @@ use {
     crate::{
         SidebarError,
         anim::{Animation, Animations, Curve, Overshoot, Spring},
-        sidebar::{Config, Edge, Focus, Size},
+        sidebar::{Config, Edge, Size},
     },
     serde::{Deserialize, Deserializer, de::Error as _},
     std::{
@@ -57,8 +57,9 @@ struct Entry {
     layer: Layer,
     #[serde(default)]
     keyboard_interactivity: KeyboardInteractivity,
+    /// Take keyboard focus on show (by remapping the surface).
     #[serde(default)]
-    focus: FocusArg,
+    focus: bool,
     #[serde(default)]
     hide_on_unfocus: bool,
     /// Default: `wl-sidebar-<name>`.
@@ -201,39 +202,6 @@ enum KeyboardInteractivity {
     OnDemand,
 }
 
-/// `false`, `true` (picked by [`auto_focus`]), `"exclusive"` or `"remap"`.
-#[derive(Deserialize, Debug, Copy, Clone)]
-#[serde(untagged)]
-enum FocusArg {
-    Bool(bool),
-    Mode(FocusMode),
-}
-
-impl Default for FocusArg {
-    fn default() -> Self {
-        Self::Bool(false)
-    }
-}
-
-#[derive(Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "kebab-case")]
-enum FocusMode {
-    Exclusive,
-    Remap,
-}
-
-/// The focus strategy for `focus = true`.
-///
-/// `Remap` needs a compositor that focuses `on-demand` layer surfaces when they get
-/// mapped. That's not detectable over Wayland, so it's chosen for compositors known to do
-/// it (niri). Everything else gets `Exclusive`, which works everywhere.
-fn auto_focus(name: &str) -> Focus {
-    let niri = std::env::var_os("NIRI_SOCKET").is_some();
-    let focus = if niri { Focus::Remap } else { Focus::Exclusive };
-    log::debug!("sidebar `{name}`: focus = true -> {focus:?} (niri: {niri})");
-    focus
-}
-
 #[derive(Deserialize, Debug, Default, Copy, Clone)]
 #[serde(rename_all = "kebab-case")]
 enum Layer {
@@ -307,12 +275,9 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
     if command.is_empty() {
         return Err(SidebarError::EmptyCommand(name));
     }
-    let focus = match entry.focus {
-        FocusArg::Bool(false) => Focus::Off,
-        FocusArg::Bool(true) => auto_focus(&name),
-        FocusArg::Mode(FocusMode::Exclusive) => Focus::Exclusive,
-        FocusArg::Mode(FocusMode::Remap) => Focus::Remap,
-    };
+    if entry.focus && !matches!(entry.keyboard_interactivity, KeyboardInteractivity::OnDemand) {
+        return Err(SidebarError::FocusNeedsOnDemand(name));
+    }
     let config = Config {
         edge: match entry.edge {
             EdgeArg::Left => Edge::Left,
@@ -333,7 +298,7 @@ pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
             Layer::Top => ZwlrLayerShellV1Layer::TOP,
             Layer::Overlay => ZwlrLayerShellV1Layer::OVERLAY,
         },
-        focus,
+        focus: entry.focus,
         namespace: entry
             .namespace
             .unwrap_or_else(|| format!("wl-sidebar-{name}")),
