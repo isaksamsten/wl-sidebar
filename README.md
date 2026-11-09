@@ -10,6 +10,17 @@ wl-sidebar proxies the app's Wayland connection, translating `xdg_toplevel` into
 through unchanged. Built on [wl-proxy](https://github.com/mahkoh/wl-proxy), with
 translation code adapted from its `wl-paper` app (GPL-3.0).
 
+## Installation
+
+```sh
+cargo install --git https://github.com/isaksamsten/wl-sidebar
+```
+
+Requires Rust 1.89 or newer and a compositor that supports `zwlr_layer_shell_v1`,
+such as umbriel, niri, sway, Hyprland, river or KDE Plasma. GNOME doesn't support
+it. Fading also needs `wp_alpha_modifier_v1`; without it, `fade` has no effect.
+wl-sidebar is developed and tested on umbriel and niri.
+
 ## Usage
 
 Define sidebars as named tables in `$XDG_CONFIG_HOME/wl-sidebar/config.toml` (default
@@ -29,7 +40,6 @@ focus = true
 ```
 
 ```sh
-cargo build --release
 wl-sidebar --toggle term          # start and show, or toggle if already running
 wl-sidebar --start --hidden term  # start in the background (no-op if running)
 wl-sidebar --close term           # quit the program (SIGTERM, then SIGKILL after 3 s)
@@ -61,9 +71,16 @@ like `--close`.
 | `hide-on-unfocus`        | `false`               | Hide on keyboard focus loss; see [Focus](#focus)                                                                                                          |
 | `namespace`              | `"wl-sidebar-<name>"` | Layer-shell namespace                                                                                                                                     |
 
-niri keybinding example:
+Keybinding examples:
+
+```toml
+# umbriel
+[keybinds]
+"Mod+B" = "spawn wl-sidebar --toggle term"
+```
 
 ```kdl
+// niri
 binds {
     Mod+B { spawn "wl-sidebar" "--toggle" "term"; }
 }
