@@ -599,6 +599,12 @@ impl WlRegistryHandler for ClientWlRegistry {
             ObjectInterface::WpAlphaModifierV1 if self.config.fade => {
                 self.filter.ignore_global(name);
             }
+            // Flatpak would hand the compositor a listening socket and the sandboxed app
+            // would connect directly, bypassing the proxy. Hiding the global makes Flatpak
+            // bind-mount our socket instead; the app is then not marked as sandboxed.
+            ObjectInterface::WpSecurityContextManagerV1 => {
+                self.filter.ignore_global(name);
+            }
             _ => {
                 self.filter.forward_global(slf, name, interface, version);
             }

@@ -136,6 +136,21 @@ The app must open its window through the proxy's `WAYLAND_DISPLAY`:
 - **GTK single-instance apps**: windows open in the existing process if one is
   running. For Ghostty, use `--gtk-single-instance=false`.
 
+## Flatpak
+
+Flatpak apps work: `command = ["flatpak", "run", "--socket=wayland", "org.example.App"]`.
+The app must use Wayland, not X11. For Electron apps, add `--ozone-platform=wayland`
+after the app ID. Single-instance rules above apply: `flatpak run` on an app that's
+already running usually opens the window in the existing instance.
+
+**The sandbox doesn't restrict Wayland access.** Normally Flatpak uses
+`wp_security_context_v1` so the compositor knows the connection is sandboxed and
+can hide privileged protocols (screen capture, virtual input, layer-shell, …). Its
+connection would then go to the compositor directly and skip wl-sidebar, so
+wl-sidebar hides that protocol. The app then connects through wl-sidebar, and the
+compositor treats it like any unsandboxed program. Only run Flatpak apps you
+trust this way.
+
 ## How hiding works
 
 Hiding animates a negative margin on the anchored edge without resizing the app.
