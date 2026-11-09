@@ -38,6 +38,10 @@ struct Args {
     /// systemd). SIGINT, SIGTERM and SIGHUP close it like --close.
     #[arg(long, group = "mode")]
     run: bool,
+    /// List the sidebars in the config file and whether each is shown, hidden or
+    /// stopped.
+    #[arg(long, group = "mode", conflicts_with = "name")]
+    list: bool,
     /// With --start or --run: start hidden.
     #[arg(long, requires = "start_or_run")]
     hidden: bool,
@@ -54,6 +58,9 @@ pub fn main() -> Result<(), SidebarError> {
         Some(p) => p,
         None => config::default_path()?,
     };
+    if args.list {
+        return list(&path);
+    }
     let sb = config::load(&path, args.name.as_deref())?;
     if args.run {
         return sidebar::run(&sb.name, sb.config, &sb.command, args.hidden, sb.animations);
@@ -106,6 +113,25 @@ fn spawn_daemon(path: &Path, name: &str, hidden: bool) -> Result<(), SidebarErro
     Ok(())
 }
 
+/// Prints `<name>\t<state>` for every sidebar in config file `path`.
+fn list(path: &Path) -> Result<(), SidebarError> {
+    let mut out = String::new();
+    for name in config::names(path)? {
+        let state = match ipc::send(&name, "status") {
+            Ok(Some(state)) => state,
+            Ok(None) => "stopped".to_owned(),
+            Err(e @ SidebarError::NoRuntimeDir) => return Err(e),
+            Err(e) => {
+                log::warn!("{}", Report::new(e));
+                "unresponsive".to_owned()
+            }
+        };
+        out.push_str(&format!("{name}\t{state}\n"));
+    }
+    print!("{out}");
+    Ok(())
+}
+
 /// Closes the running sidebar `name` and waits for it to exit, so that a following
 /// `--toggle` starts a fresh instance.
 fn close(name: &str) -> Result<(), SidebarError> {
@@ -141,4 +167,3 @@ fn open_log(name: &str) -> Result<(PathBuf, File, File), SidebarError> {
     let err = out.try_clone().map_err(err)?;
     Ok((path, out, err))
 }
-

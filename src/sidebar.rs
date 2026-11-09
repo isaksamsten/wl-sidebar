@@ -260,6 +260,11 @@ fn snapshot() -> Snapshot {
     }
 }
 
+/// The current state: `shown` or `hidden` (the target, if mid-animation).
+pub fn status() -> &'static str {
+    if snapshot().visible { "shown" } else { "hidden" }
+}
+
 /// Shows or hides the sidebar. With `focus`, a shown (fully slid in) sidebar
 /// without keyboard focus gets focused instead of hidden. Returns the resulting state.
 pub fn toggle() -> &'static str {
@@ -693,10 +698,11 @@ pub fn run(
     });
 
     // Becomes the running instance (fails if there already is one) and starts serving
-    // `--toggle` and `--close`. The lock is held for the lifetime of the process.
+    // `--toggle`, `--close` and `--list`. The lock is held for the lifetime of the process.
     let _instance = ipc::listen(name, |cmd| match cmd {
         "toggle" => Ok(toggle().to_owned()),
         "close" => child::close(c::SIGTERM).map(str::to_owned),
+        "status" => Ok(status().to_owned()),
         _ => Err(format!("unknown command `{cmd}`")),
     })?;
 

@@ -33,6 +33,7 @@ cargo build --release
 wl-sidebar --toggle term          # start and show, or toggle if already running
 wl-sidebar --start --hidden term  # start in the background (no-op if running)
 wl-sidebar --close term           # quit the program (SIGTERM, then SIGKILL after 3 s)
+wl-sidebar --list                 # configured sidebars and their state
 ```
 
 Sidebars run in the background, so `--close` is how to quit one whose program has no

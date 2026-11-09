@@ -251,13 +251,21 @@ pub fn default_path() -> Result<PathBuf, SidebarError> {
     Ok(dir.join("wl-sidebar").join("config.toml"))
 }
 
+fn read_entries(path: &Path) -> Result<BTreeMap<String, Entry>, SidebarError> {
+    let text =
+        fs::read_to_string(path).map_err(|e| SidebarError::ReadConfig(path.to_owned(), e))?;
+    toml::from_str(&text).map_err(|e| SidebarError::ParseConfig(path.to_owned(), e))
+}
+
+/// The names of all sidebars in the config file at `path`, sorted.
+pub fn names(path: &Path) -> Result<Vec<String>, SidebarError> {
+    Ok(read_entries(path)?.into_keys().collect())
+}
+
 /// Loads the sidebar `name` from the config file at `path`. Without a name, the file
 /// must define exactly one sidebar.
 pub fn load(path: &Path, name: Option<&str>) -> Result<Sidebar, SidebarError> {
-    let text =
-        fs::read_to_string(path).map_err(|e| SidebarError::ReadConfig(path.to_owned(), e))?;
-    let mut entries: BTreeMap<String, Entry> =
-        toml::from_str(&text).map_err(|e| SidebarError::ParseConfig(path.to_owned(), e))?;
+    let mut entries = read_entries(path)?;
     let (name, entry) = match name {
         Some(name) => entries
             .remove_entry(name)

@@ -1,4 +1,4 @@
-//! Control socket used by `--toggle` and `--close` to talk to the running instance.
+//! Control socket used by `--toggle`, `--close` and `--list` to talk to the running instance.
 //!
 //! The running instance holds an exclusive flock on `$XDG_RUNTIME_DIR/wl-sidebar-<name>.pid`
 //! (which contains its pid, for error messages) for its whole lifetime and listens on
