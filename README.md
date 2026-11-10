@@ -112,9 +112,18 @@ overshoot = "clamp"
   offscreen.
 
 With `fade = true`, opacity follows the animation. Add `slide = false` to fade
-without sliding; the sidebar moves offscreen once transparent. Subsurfaces fade
+without sliding; the sidebar is unmapped once transparent. Subsurfaces fade
 too, but popups and cursors don't. The app cannot use `wp_alpha_modifier_v1`
 itself while fading is enabled.
+
+### Multiple monitors
+
+Sliding moves the sidebar past its monitor's edge. Some compositors (wlroots-based
+ones, Umbriel) don't clip layer surfaces to their monitor, so on an edge shared
+with another monitor the sidebar shows up there while it slides. Use
+`slide = false` for such sidebars (optionally with `fade = true`): the sidebar
+stays in place and is unmapped while hidden. The app then cannot use explicit
+sync (`linux-drm-syncobj`).
 
 ## Focus
 

@@ -204,18 +204,18 @@ struct ClientOrgKdeKwinServerDecorationManager;
 
 struct ClientOrgKdeKwinServerDecoration;
 
-/// Handler for client-created wl_compositor objects (with `--output`, `focus` or
-/// `fade`).
+/// Handler for client-created wl_compositor objects (with `--output`, `focus`,
+/// `slide = false` or `fade`).
 struct ClientWlCompositor {
     fade: bool,
 }
 
-/// Handler for client-created wl_surface objects (with `--output`, `focus` or
-/// `fade`). Drops enter/leave events for the proxy's own wl_output, which the client
-/// doesn't know.
+/// Handler for client-created wl_surface objects (with `--output`, `focus`,
+/// `slide = false` or `fade`). Drops enter/leave events for the proxy's own wl_output,
+/// which the client doesn't know.
 #[derive(Default)]
 struct ClientWlSurface {
-    /// Set on the sidebar's surface with `focus`.
+    /// Set on the sidebar's surface with `focus` or without `slide`.
     remap: Option<Rc<Remap>>,
     /// Set on every surface with `fade`.
     fade: Option<Rc<FadeSurface>>,
@@ -479,6 +479,9 @@ impl WlSurfaceHandler for ClientWlSurface {
         }
         if self.remap.as_ref().is_none_or(|r| r.commit()) {
             slf.send_commit();
+            if let Some(r) = &self.remap {
+                r.after_commit(slf);
+            }
         }
     }
 
@@ -544,6 +547,7 @@ impl WlRegistryHandler for ClientWlRegistry {
             WlCompositor::INTERFACE
                 if self.config.output.is_some()
                     || self.config.focus
+                    || !self.config.slide
                     || self.config.fade =>
             {
                 let id = id.downcast::<WlCompositor>();
@@ -592,7 +596,9 @@ impl WlRegistryHandler for ClientWlRegistry {
             }
             // With explicit sync, attaching a buffer requires fresh acquire/release
             // points, so remap could not re-attach the client's buffer.
-            ObjectInterface::WpLinuxDrmSyncobjManagerV1 if self.config.focus => {
+            ObjectInterface::WpLinuxDrmSyncobjManagerV1
+                if self.config.focus || !self.config.slide =>
+            {
                 self.filter.ignore_global(name);
             }
             // We set the alpha multiplier ourselves, and a surface can only have one.
@@ -669,7 +675,7 @@ impl XdgSurfaceHandler for ClientXdgSurface {
         );
         // Sets size, anchor, margin, exclusive zone and keyboard interactivity. The
         // client's initial commit applies them.
-        let remap = c.focus.then(Remap::new);
+        let remap = (c.focus || !c.slide).then(Remap::new);
         if let Some(remap) = &remap
             && let Ok(mut h) = self.wl_surface.try_get_handler_mut::<ClientWlSurface>()
         {

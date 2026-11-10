@@ -148,7 +148,8 @@ pub struct Config {
     pub output: Option<String>,
     /// Hide when the sidebar loses keyboard focus.
     pub hide_on_unfocus: bool,
-    /// Slide in and out. Otherwise the sidebar only moves offscreen once fully hidden.
+    /// Slide in and out. Otherwise the sidebar stays in place and is unmapped once fully
+    /// hidden (see `remap`).
     pub slide: bool,
     /// Fade in and out (`wp_alpha_modifier_v1`).
     pub fade: bool,
@@ -325,8 +326,8 @@ struct Layout {
 }
 
 fn layout(c: &Config, size: u32, s: Snapshot) -> Layout {
-    // Without sliding, the sidebar stays in place while it fades and only moves
-    // offscreen once fully hidden.
+    // Without sliding, the sidebar stays in place while it fades and is unmapped once
+    // fully hidden. It only moves offscreen if it can't be unmapped (not mapped yet).
     let shown = if c.slide {
         s.pos
     } else if s.visible || s.pos > 0.0 {
@@ -377,7 +378,7 @@ struct Sidebar {
     /// Effective size last sent with set_size.
     placed: Cell<u32>,
     applied: Cell<Option<Layout>>,
-    /// Set with `focus`.
+    /// Set with `focus` or without `slide`.
     remap: Option<Rc<Remap>>,
     /// `focus`: progress of taking focus with `EXCLUSIVE` interactivity.
     grab: Cell<Grab>,
@@ -563,7 +564,9 @@ fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
                 // With remapping, showing maps the (unmapped while hidden) surface, which
                 // takes focus by itself; only a refocus needs an extra unmap.
                 let mut remap_now = false;
-                if !s.visible {
+                if !c.focus {
+                    // Remapping only keeps a hidden sidebar off other outputs.
+                } else if !s.visible {
                     sb.grab.set(Grab::Idle);
                 } else if REMAP_FALLBACK.load(Relaxed) {
                     remap_now = refocus;
@@ -616,18 +619,30 @@ fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
                             if layer.version() >= ZwlrLayerSurfaceV1::MSG__SET_LAYER__SINCE {
                                 layer.send_set_layer(c.layer);
                             }
-                            sb.applied.set(Some(place(&layer, c, size)));
+                            let l = place(&layer, c, size);
+                            sb.applied.set(Some(l));
                             sb.placed.set(size);
+                            // Mapping an on-demand surface focuses it on some compositors
+                            // (niri, Umbriel); only `focus` wants that. Map with `NONE`
+                            // and set `l`'s interactivity once mapped.
+                            use ZwlrLayerSurfaceV1KeyboardInteractivity as K;
+                            let restore = (!c.focus && l.keyboard_interactivity != K::NONE)
+                                .then_some(l.keyboard_interactivity);
+                            if restore.is_some() {
+                                layer.send_set_keyboard_interactivity(K::NONE);
+                            }
                             apply_fade(c, &wl_surface, s);
                             wl_surface.send_commit();
-                            remap.start_remap();
+                            remap.start_remap(&layer, restore);
                         }
                         // Committing while unmapped would trigger a configure for the
                         // reset (invalid) state.
                         return true;
                     }
+                    // Once fully hidden: `focus` falls back to taking focus by remapping;
+                    // without `slide`, unmapping keeps the sidebar off other outputs.
                     Phase::Mapped
-                        if REMAP_FALLBACK.load(Relaxed)
+                        if (!c.slide || (c.focus && REMAP_FALLBACK.load(Relaxed)))
                             && !s.visible
                             && !s.animating
                             && remap.unmap(&wl_surface) =>
@@ -650,7 +665,12 @@ fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
                 l.keyboard_interactivity = ZwlrLayerSurfaceV1KeyboardInteractivity::EXCLUSIVE;
             }
             if sb.applied.get() != Some(l) {
-                send_layout(&layer, c, l);
+                let mut sent = l;
+                if let Some(remap) = &sb.remap {
+                    sent.keyboard_interactivity =
+                        remap.hold_interactivity(l.keyboard_interactivity);
+                }
+                send_layout(&layer, c, sent);
                 sb.applied.set(Some(l));
                 wl_surface.send_commit();
             } else if faded {

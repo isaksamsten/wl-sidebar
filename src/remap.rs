@@ -1,10 +1,15 @@
-//! `focus = true`: unmap the sidebar once it's fully hidden and map it again on show.
+//! Unmap the sidebar once it's fully hidden and map it again on show. Used for:
 //!
-//! Layer-shell has no request to focus an `on-demand` surface. Compositors such as niri
-//! and Umbriel give keyboard focus to an `on-demand` layer surface when it gets mapped,
-//! though. Briefly switching to `exclusive` and back doesn't work on niri, but remapping
-//! on every show does: it grabs focus once, after which the sidebar behaves like any
-//! `on-demand` surface (click elsewhere to unfocus, click it to focus again).
+//! - `focus = true`: Layer-shell has no request to focus an `on-demand` surface.
+//!   Compositors such as niri and Umbriel give keyboard focus to an `on-demand` layer
+//!   surface when it gets mapped, though. Briefly switching to `exclusive` and back
+//!   doesn't work on niri, but remapping on every show does: it grabs focus once, after
+//!   which the sidebar behaves like any `on-demand` surface (click elsewhere to unfocus,
+//!   click it to focus again).
+//! - `slide = false`: a hidden sidebar is not moved past its output's edge, where
+//!   compositors that don't clip layer surfaces (wlroots, Umbriel) would draw it on a
+//!   neighbouring output. These sidebars must not take focus by mapping, so the commit
+//!   that maps them uses `NONE` interactivity, and a second commit restores it.
 //!
 //! The client doesn't know about any of this:
 //!
@@ -31,7 +36,9 @@ use {
                 wl_buffer::{WlBuffer, WlBufferHandler},
                 wl_surface::WlSurface,
             },
-            wlr_layer_shell_unstable_v1::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+            wlr_layer_shell_unstable_v1::zwlr_layer_surface_v1::{
+                ZwlrLayerSurfaceV1, ZwlrLayerSurfaceV1KeyboardInteractivity,
+            },
         },
     },
 };
@@ -56,6 +63,12 @@ pub struct Remap {
     committed: Cell<bool>,
     /// Size of the last configure forwarded to the client.
     size: Cell<Option<(u32, u32)>>,
+    /// Interactivity to set once the remapped surface is mapped (it was mapped with
+    /// `NONE` so as not to take focus).
+    restore: Cell<Option<ZwlrLayerSurfaceV1KeyboardInteractivity>>,
+    /// The client's next commit with a buffer maps the surface; `restore` follows it.
+    client_maps: Cell<bool>,
+    layer: RefCell<Weak<ZwlrLayerSurfaceV1>>,
 }
 
 impl Remap {
@@ -66,6 +79,9 @@ impl Remap {
             held: Cell::new(false),
             committed: Cell::new(false),
             size: Cell::new(None),
+            restore: Cell::new(None),
+            client_maps: Cell::new(false),
+            layer: Default::default(),
         })
     }
 
@@ -111,6 +127,39 @@ impl Remap {
         true
     }
 
+    /// After a client commit was forwarded.
+    pub fn after_commit(&self, wl_surface: &WlSurface) {
+        if self.client_maps.get() && self.committed.get() {
+            self.client_maps.set(false);
+            self.restore(wl_surface);
+        }
+    }
+
+    /// Sets the interactivity held back while mapping, in a commit of its own.
+    fn restore(&self, wl_surface: &WlSurface) {
+        let Some(interactivity) = self.restore.take() else {
+            return;
+        };
+        if let Some(layer) = self.layer.borrow().upgrade() {
+            layer.send_set_keyboard_interactivity(interactivity);
+            wl_surface.send_commit();
+        }
+    }
+
+    /// Interactivity to send now instead of `wanted`. While the surface is mapped with
+    /// `NONE`, that stays in place and `wanted` is set once mapped.
+    pub fn hold_interactivity(
+        &self,
+        wanted: ZwlrLayerSurfaceV1KeyboardInteractivity,
+    ) -> ZwlrLayerSurfaceV1KeyboardInteractivity {
+        if self.restore.get().is_some() {
+            self.restore.set(Some(wanted));
+            ZwlrLayerSurfaceV1KeyboardInteractivity::NONE
+        } else {
+            wanted
+        }
+    }
+
     /// Unmaps the surface (null buffer + commit) if it's mapped. Returns whether it did.
     pub fn unmap(&self, wl_surface: &WlSurface) -> bool {
         if self.phase.get() != Phase::Mapped || !self.committed.get() {
@@ -120,14 +169,25 @@ impl Remap {
         wl_surface.send_attach(None, 0, 0);
         wl_surface.send_commit();
         self.phase.set(Phase::Unmapped);
+        // Hidden before the held-back interactivity was set: it no longer applies.
+        self.restore.set(None);
+        self.client_maps.set(false);
         true
     }
 
     /// Called after the full layer state was sent and committed while unmapped; the
-    /// compositor answers with a new initial configure.
-    pub fn start_remap(&self) {
+    /// compositor answers with a new initial configure. `restore` is the interactivity
+    /// to set once mapped, if it was committed as `NONE`.
+    pub fn start_remap(
+        &self,
+        layer: &Rc<ZwlrLayerSurfaceV1>,
+        restore: Option<ZwlrLayerSurfaceV1KeyboardInteractivity>,
+    ) {
         log::debug!("remapping");
         self.phase.set(Phase::Remapping);
+        *self.layer.borrow_mut() = Rc::downgrade(layer);
+        self.restore.set(restore);
+        self.client_maps.set(false);
     }
 
     /// Layer-surface configure. Returns `true` if handled here, `false` if it must be
@@ -163,6 +223,7 @@ impl Remap {
                         wl_surface.send_commit();
                         self.committed.set(true);
                         log::debug!("remapped");
+                        self.restore(wl_surface);
                         true
                     }
                     // The size changed (or the client destroyed its buffer): let the
@@ -170,6 +231,7 @@ impl Remap {
                     _ => {
                         log::debug!("remapping via the client");
                         self.size.set(Some((width, height)));
+                        self.client_maps.set(true);
                         false
                     }
                 }
