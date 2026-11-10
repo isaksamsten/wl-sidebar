@@ -59,8 +59,8 @@ like `--close`.
 | ------------------------ | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `command`                | required              | Program and args as an array, or a string run with `sh -c`                                                                                                |
 | `edge`                   | `"left"`              | `left\|right\|top\|bottom`                                                                                                                                |
-| `size`                   | `400`                 | Width (height for top/bottom) in pixels, or a fraction of the output's usable area (`0.5`, `"50%"`), measured at startup. At least the app's minimum size |
-| `output`                 |                       | Output name, e.g. `"DP-1"`                                                                                                                                |
+| `size`                   | `400`                 | Width (height for top/bottom) in pixels, or a fraction of the output's usable area (`0.5`, `"50%"`), measured per output. At least the app's minimum size |
+| `output`                 |                       | Output name, e.g. `"DP-1"`. Unset: the compositor picks one, see [Multiple monitors](#multiple-monitors)                                                  |
 | `reserve`                | `true`                | Reserve space; `false` floats over windows                                                                                                                |
 | `animation`              | spring                | See [Animation](#animation)                                                                                                                               |
 | `slide`                  | `true`                | Slide in/out; `false` keeps the sidebar in place during fades                                                                                             |
@@ -124,6 +124,13 @@ with another monitor the sidebar shows up there while it slides. Use
 `slide = false` for such sidebars (optionally with `fade = true`): the sidebar
 stays in place and is unmapped while hidden. The app then cannot use explicit
 sync (`linux-drm-syncobj`).
+
+With `output` set, the sidebar always opens on that monitor. Otherwise the
+compositor picks one when the sidebar starts, usually the focused monitor or the
+one under the cursor. Sidebars that are unmapped while hidden (`slide = false`,
+and `focus = true` where focus is taken by remapping) are placed again on every
+show, so they open on the active monitor. Sliding sidebars stay on the monitor
+they started on. A relative `size` is measured again on each show.
 
 ## Focus
 

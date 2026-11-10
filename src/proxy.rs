@@ -11,7 +11,12 @@ use {
         sidebar::{self, Config, KeyboardFocus},
     },
     arrayvec::ArrayVec,
-    std::{cell::OnceCell, mem, rc::Rc, sync::Arc},
+    std::{
+        cell::{OnceCell, RefCell},
+        mem,
+        rc::Rc,
+        sync::Arc,
+    },
     wl_proxy::{
         baseline::Baseline,
         global_mapper::GlobalMapper,
@@ -155,7 +160,7 @@ struct ClientXdgSurface {
     wl_surface: Rc<WlSurface>,
     xdg_surface: Rc<XdgSurface>,
     xdg_wm_base: Rc<XdgWmBase>,
-    zwlr_layer_surface_v1: Option<Rc<ZwlrLayerSurfaceV1>>,
+    zwlr_layer_surface_v1: Option<LayerSlot>,
     geometry: Option<[i32; 4]>,
     /// Whether this object has been forwarded to the server. We cannot initially forward
     /// to the server because we don't know if this will become an xdg_toplevel or an
@@ -163,15 +168,21 @@ struct ClientXdgSurface {
     has_server: bool,
 }
 
+/// The sidebar's current layer surface. Replaced by [`relocate`] to move the sidebar to
+/// another output.
+type LayerSlot = Rc<RefCell<Rc<ZwlrLayerSurfaceV1>>>;
+
 /// Handler for client-created xdg_toplevel objects.
 struct ClientXdgToplevel {
     /// The corresponding zwlr_layer_surface_v1.
-    zwlr_layer_surface_v1: Rc<ZwlrLayerSurfaceV1>,
+    zwlr_layer_surface_v1: LayerSlot,
     config: Arc<Config>,
 }
 
 /// Handler for proxy-created zwlr_layer_surface_v1 objects.
 struct ProxyZwlrLayerSurfaceV1 {
+    zwlr_layer_shell_v1: Rc<ZwlrLayerShellV1>,
+    slot: LayerSlot,
     xdg_surface: Rc<XdgSurface>,
     xdg_toplevel: Rc<XdgToplevel>,
     wl_surface: Rc<WlSurface>,
@@ -180,6 +191,14 @@ struct ProxyZwlrLayerSurfaceV1 {
     /// and must not be forwarded to the client.
     measuring: bool,
     remap: Option<Rc<Remap>>,
+}
+
+impl ProxyZwlrLayerSurfaceV1 {
+    /// Whether `slf` is the sidebar's current layer surface, not one replaced by
+    /// [`relocate`].
+    fn is_current(&self, slf: &ZwlrLayerSurfaceV1) -> bool {
+        std::ptr::eq(&**self.slot.borrow(), slf)
+    }
 }
 
 /// Handler for client-created xdg_positioner objects.
@@ -687,11 +706,14 @@ impl XdgSurfaceHandler for ClientXdgSurface {
             id.send_wm_capabilities(&[]);
         }
         id.set_forward_to_server(false);
+        let slot = Rc::new(RefCell::new(zwlr_layer_surface_v1.clone()));
         id.set_handler(ClientXdgToplevel {
-            zwlr_layer_surface_v1: zwlr_layer_surface_v1.clone(),
+            zwlr_layer_surface_v1: slot.clone(),
             config: self.config.clone(),
         });
         zwlr_layer_surface_v1.set_handler(ProxyZwlrLayerSurfaceV1 {
+            zwlr_layer_shell_v1: self.zwlr_layer_shell_v1.clone(),
+            slot: slot.clone(),
             xdg_surface: self.xdg_surface.clone(),
             xdg_toplevel: id.clone(),
             wl_surface: self.wl_surface.clone(),
@@ -699,7 +721,7 @@ impl XdgSurfaceHandler for ClientXdgSurface {
             measuring,
             remap,
         });
-        self.zwlr_layer_surface_v1 = Some(zwlr_layer_surface_v1.clone());
+        self.zwlr_layer_surface_v1 = Some(slot);
     }
 
     fn handle_get_popup(
@@ -739,8 +761,8 @@ impl XdgSurfaceHandler for ClientXdgSurface {
         {
             positioner.send_set_anchor_rect(px, py, pw, ph);
         }
-        if let Some(zwlr_layer_surface_v1) = zwlr_layer_surface_v1 {
-            zwlr_layer_surface_v1.send_get_popup(id);
+        if let Some(slot) = zwlr_layer_surface_v1 {
+            slot.borrow().send_get_popup(id);
         }
         if let Some(pg) = parent_geometry {
             id.set_handler(ClientXdgPopup {
@@ -764,8 +786,8 @@ impl XdgSurfaceHandler for ClientXdgSurface {
     }
 
     fn handle_ack_configure(&mut self, slf: &Rc<XdgSurface>, serial: u32) {
-        if let Some(tl) = &self.zwlr_layer_surface_v1 {
-            tl.send_ack_configure(serial);
+        if let Some(slot) = &self.zwlr_layer_surface_v1 {
+            slot.borrow().send_ack_configure(serial);
         } else if self.has_server {
             slf.send_ack_configure(serial);
         }
@@ -775,18 +797,22 @@ impl XdgSurfaceHandler for ClientXdgSurface {
 impl XdgToplevelHandler for ClientXdgToplevel {
     fn handle_destroy(&mut self, slf: &Rc<XdgToplevel>) {
         slf.unset_handler();
-        self.zwlr_layer_surface_v1.send_destroy();
+        self.zwlr_layer_surface_v1.borrow().send_destroy();
     }
 
     fn handle_set_min_size(&mut self, _slf: &Rc<XdgToplevel>, width: i32, height: i32) {
-        sidebar::set_min_size(&self.zwlr_layer_surface_v1, width, height, &self.config);
+        let layer = self.zwlr_layer_surface_v1.borrow().clone();
+        sidebar::set_min_size(&layer, width, height, &self.config);
     }
 }
 
 impl ZwlrLayerSurfaceV1Handler for ProxyZwlrLayerSurfaceV1 {
     fn delete_id(&mut self, slf: &Rc<ZwlrLayerSurfaceV1>) {
         slf.unset_handler();
-        self.xdg_toplevel.delete_id();
+        // A layer surface replaced by `relocate` doesn't own the client's toplevel.
+        if self.is_current(slf) {
+            self.xdg_toplevel.delete_id();
+        }
     }
 
     fn handle_configure(
@@ -796,6 +822,9 @@ impl ZwlrLayerSurfaceV1Handler for ProxyZwlrLayerSurfaceV1 {
         width: u32,
         height: u32,
     ) {
+        if !self.is_current(slf) {
+            return;
+        }
         if self.measuring {
             self.measuring = false;
             slf.send_ack_configure(serial);
@@ -837,9 +866,52 @@ impl ZwlrLayerSurfaceV1Handler for ProxyZwlrLayerSurfaceV1 {
         self.xdg_surface.send_configure(serial);
     }
 
-    fn handle_closed(&mut self, _slf: &Rc<ZwlrLayerSurfaceV1>) {
-        self.xdg_toplevel.send_close();
+    fn handle_closed(&mut self, slf: &Rc<ZwlrLayerSurfaceV1>) {
+        if self.is_current(slf) {
+            self.xdg_toplevel.send_close();
+        }
     }
+}
+
+/// Replaces the sidebar's (unmapped) layer surface with a new one without an output, so
+/// that the compositor puts it on the active output. The new surface has the default
+/// layer-surface state; the caller sets it and commits. With a relative size, the next
+/// configure is a measuring one (see `sidebar::measured`).
+///
+/// wlroots and smithay allow a surface to get a new layer surface once the previous
+/// one is destroyed.
+pub fn relocate(old: &Rc<ZwlrLayerSurfaceV1>) -> Option<Rc<ZwlrLayerSurfaceV1>> {
+    let (shell, slot, wl_surface, handler) = {
+        let h = old.try_get_handler_ref::<ProxyZwlrLayerSurfaceV1>().ok()?;
+        if !h.is_current(old) {
+            return None;
+        }
+        let handler = ProxyZwlrLayerSurfaceV1 {
+            zwlr_layer_shell_v1: h.zwlr_layer_shell_v1.clone(),
+            slot: h.slot.clone(),
+            xdg_surface: h.xdg_surface.clone(),
+            xdg_toplevel: h.xdg_toplevel.clone(),
+            wl_surface: h.wl_surface.clone(),
+            config: h.config.clone(),
+            measuring: matches!(h.config.size, sidebar::Size::Fraction(_)),
+            remap: h.remap.clone(),
+        };
+        (
+            h.zwlr_layer_shell_v1.clone(),
+            h.slot.clone(),
+            h.wl_surface.clone(),
+            handler,
+        )
+    };
+    // The surface can only get a new role object once the old one is gone.
+    old.send_destroy();
+    let new = shell.create_child::<ZwlrLayerSurfaceV1>();
+    let c = handler.config.clone();
+    shell.send_get_layer_surface(&new, &wl_surface, None, c.layer, &c.namespace);
+    new.set_handler(handler);
+    *slot.borrow_mut() = new.clone();
+    log::debug!("relocated the layer surface");
+    Some(new)
 }
 
 impl XdgPositionerHandler for ClientXdgPositioner {

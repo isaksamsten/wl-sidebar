@@ -438,12 +438,18 @@ fn place(layer: &ZwlrLayerSurfaceV1, c: &Config, size: u32) -> Layout {
     l
 }
 
+/// Stretches the surface over the whole output, so that the compositor's next configure
+/// reports the available area for a relative size; see [`measured`].
+fn send_measuring(layer: &ZwlrLayerSurfaceV1) {
+    use ZwlrLayerSurfaceV1Anchor as A;
+    layer.send_set_size(0, 0);
+    layer.send_set_anchor(A::TOP | A::BOTTOM | A::LEFT | A::RIGHT);
+}
+
 /// Called from `get_toplevel` for every new layer surface. Does not commit; the
 /// client's initial commit applies the state.
 ///
-/// Returns `true` if the size is relative. The surface is then first stretched over the
-/// whole output so that the compositor's first configure reports the available area;
-/// see [`measured`].
+/// Returns `true` if the size is relative. The surface is then measured first.
 pub fn register(
     layer: &Rc<ZwlrLayerSurfaceV1>,
     wl_surface: &Rc<WlSurface>,
@@ -453,9 +459,7 @@ pub fn register(
     let (size, applied) = match c.size {
         Size::Pixels(px) => (px, Some(place(layer, c, px))),
         Size::Fraction(_) => {
-            use ZwlrLayerSurfaceV1Anchor as A;
-            layer.send_set_size(0, 0);
-            layer.send_set_anchor(A::TOP | A::BOTTOM | A::LEFT | A::RIGHT);
+            send_measuring(layer);
             (0, None)
         }
     };
@@ -477,8 +481,8 @@ pub fn register(
 
 /// Handles the measuring configure (already acked) of a relative-size sidebar: resolves
 /// the size, moves the surface to its edge, and commits so that the compositor sends
-/// the real configure, which is forwarded to the client. The client has not attached a
-/// buffer yet, so this commit is buffer-less.
+/// the real configure. The surface has no buffer yet (or is unmapped, when relocated),
+/// so this commit is buffer-less.
 pub fn measured(
     layer: &Rc<ZwlrLayerSurfaceV1>,
     wl_surface: &WlSurface,
@@ -502,7 +506,15 @@ pub fn measured(
         {
             sb.size.set(size);
             let size = sb.effective();
-            sb.applied.set(Some(place(layer, c, size)));
+            let l = place(layer, c, size);
+            // While remapping without taking focus, mapping must use `NONE`.
+            if let Some(remap) = &sb.remap {
+                let k = remap.hold_interactivity(l.keyboard_interactivity);
+                if k != l.keyboard_interactivity {
+                    layer.send_set_keyboard_interactivity(k);
+                }
+            }
+            sb.applied.set(Some(l));
             sb.placed.set(size);
         }
     });
@@ -547,8 +559,8 @@ fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
     let now = Instant::now();
     let mut wake: Option<Instant> = None;
     SIDEBARS.with_borrow_mut(|v| {
-        v.retain(|sb| {
-            let (Some(layer), Some(wl_surface)) = (sb.layer.upgrade(), sb.wl_surface.upgrade())
+        v.retain_mut(|sb| {
+            let (Some(mut layer), Some(wl_surface)) = (sb.layer.upgrade(), sb.wl_surface.upgrade())
             else {
                 return false;
             };
@@ -559,7 +571,7 @@ fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
             if size == 0 {
                 return true; // still measuring
             }
-            if let Some(remap) = &sb.remap {
+            if let Some(remap) = sb.remap.clone() {
                 let was_shown = sb.shown.replace(s.visible);
                 // With remapping, showing maps the (unmapped while hidden) surface, which
                 // takes focus by itself; only a refocus needs an extra unmap.
@@ -614,20 +626,40 @@ fn update_sidebars(c: &Config, s: Snapshot) -> Option<Instant> {
                 match remap.phase() {
                     Phase::Unmapped => {
                         if s.visible {
-                            // Unmapping reset all layer state; send all of it again.
-                            // Some smithay versions also reset the layer (to `background`).
-                            if layer.version() >= ZwlrLayerSurfaceV1::MSG__SET_LAYER__SINCE {
-                                layer.send_set_layer(c.layer);
-                            }
-                            let l = place(&layer, c, size);
-                            sb.applied.set(Some(l));
-                            sb.placed.set(size);
                             // Mapping an on-demand surface focuses it on some compositors
                             // (niri, Umbriel); only `focus` wants that. Map with `NONE`
-                            // and set `l`'s interactivity once mapped.
+                            // and set the interactivity once mapped.
                             use ZwlrLayerSurfaceV1KeyboardInteractivity as K;
-                            let restore = (!c.focus && l.keyboard_interactivity != K::NONE)
-                                .then_some(l.keyboard_interactivity);
+                            let wanted = layout(c, size, s).keyboard_interactivity;
+                            let restore = (!c.focus && wanted != K::NONE).then_some(wanted);
+                            // Without `output`, open on the active output: a new layer
+                            // surface without an output goes where the compositor puts
+                            // new surfaces.
+                            let new = match c.output {
+                                None => proxy::relocate(&layer),
+                                Some(_) => None,
+                            };
+                            let relocated = new.is_some();
+                            if let Some(new) = new {
+                                sb.layer = Rc::downgrade(&new);
+                                layer = new;
+                            }
+                            // Unmapping reset all layer state; send all of it again.
+                            // Some smithay versions also reset the layer (to `background`).
+                            if !relocated
+                                && layer.version() >= ZwlrLayerSurfaceV1::MSG__SET_LAYER__SINCE
+                            {
+                                layer.send_set_layer(c.layer);
+                            }
+                            if relocated && matches!(c.size, Size::Fraction(_)) {
+                                // The output may differ in size: measure it again.
+                                sb.size.set(0);
+                                sb.applied.set(None);
+                                send_measuring(&layer);
+                            } else {
+                                sb.applied.set(Some(place(&layer, c, size)));
+                                sb.placed.set(size);
+                            }
                             if restore.is_some() {
                                 layer.send_set_keyboard_interactivity(K::NONE);
                             }
